@@ -50,6 +50,10 @@
 输入：一个会话的完整事件序列（`observeSession` 返回，尾部开轮次已被宿主补成
 `interrupted`）、配置、当前时间。输出：继续（带原因）或跳过（带原因）。
 
+扫描流程（scan.ts）：`listSessions()` 拿全量 → 逐个按第 3、4、5 条过滤 →
+`stat(id)` 取日志路径读 mtime，mtime 早于时间窗的直接跳过（免整读旧日志）→
+余者 `observeSession(id)` 读事件进判定器 → 收集候选，按 `staggerMs` 逐个投递。
+
 按顺序：
 
 1. 无任何事件 → 跳过（空白会话）。
@@ -57,7 +61,9 @@
 3. `header.origin === 'subagent'` 或 `header.parentSession` 存在 → 跳过（子代理会话，
    归父会话路由管）。此条在扫描层过滤，不在判定器内。
 4. 已归档（`archivedSessionIds` 命中）→ 跳过。同上，扫描层过滤。
-5. 会话正在运行（`agents.get(id)` 的 agent `status === 'running'`）→ 跳过。扫描层过滤。
+5. 会话正在运行（`agents.get(id)` 的 agent `status === 'running'`）→ 跳过。
+   在册但空闲（attached-idle，用户开着会话没在跑）→ 仍继续——这正是本插件要替
+   用户省掉的那次手动点击。扫描层过滤。
 6. **没有任何 `turn/end`**：
    - 存在 `user/message` 或 `agent/inbox/spliced` → **继续**（原因 `interrupted`：
      消息已收下但轮次从未打开——停止操作不可能产生这种形态，因为没有可停的轮次）。
