@@ -28,9 +28,10 @@ export const name = 'auto-resume'
 /** 必需的宿主服务：缺席即本行装载失败（fail loud，不留静默残废）。 */
 export const inject = ['sessionQuery', 'agents', 'workspaceRegistry', 'sessionController']
 
-/** 插件 apply 需要的宿主上下文面（注入服务 + effect + 机会式 inject）。 */
+/** 插件 apply 需要的宿主上下文面（注入服务 + effect + 机会式 get/inject）。 */
 interface PluginContext extends ScanHosts, HealthRouteContext {
   sessionController: PromptHost
+  get?(serviceName: string): unknown
   inject?(deps: string[], body: (child: unknown) => void): unknown
 }
 
@@ -79,7 +80,7 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
   snapshot.startedAt = Date.now()
 
   const rows = await scanSessions(
-    ctx,
+    hostsOf(ctx),
     {
       now: snapshot.startedAt,
       lookbackHours: config.lookbackHours,
@@ -118,6 +119,36 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
 async function statMtimeMs(path: string): Promise<number | undefined> {
   try {
     return (await stat(path)).mtimeMs
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 组装扫描需要的宿主面。
+ *
+ * 可选服务（`sessionPersistence`，只影响预筛效率）必须走 `ctx.get` 现取：
+ * cordis 上下文上读一个未注入的属性会当场抛错（可选链救不了「读属性」这一步），
+ * `get` 才是缺席回 undefined 的安全口。取不到就让预筛缺席，功能不缺。
+ */
+function hostsOf(ctx: PluginContext): ScanHosts {
+  const hosts: ScanHosts = {
+    sessionQuery: ctx.sessionQuery,
+    agents: ctx.agents,
+    workspaceRegistry: ctx.workspaceRegistry,
+  }
+  const persistence = optionalService(ctx, 'sessionPersistence')
+  if (persistence !== undefined) {
+    hosts.sessionPersistence = persistence as NonNullable<ScanHosts['sessionPersistence']>
+  }
+  return hosts
+}
+
+/** 按名字安全取一个可能缺席的服务：没有 get 或取时抛错都算缺席。 */
+function optionalService(ctx: PluginContext, serviceName: string): unknown {
+  if (typeof ctx.get !== 'function') return undefined
+  try {
+    return ctx.get(serviceName)
   } catch {
     return undefined
   }

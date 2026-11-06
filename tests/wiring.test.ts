@@ -138,4 +138,32 @@ describe('apply 行为', async () => {
     expect(disposers).toHaveLength(1)
     expect(() => disposers[0]?.()).not.toThrow()
   })
+
+  it('可选服务 sessionPersistence 未注入（读属性即抛）→ 走 ctx.get，扫描照常', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const { prompts, services } = fakeServices()
+    // cordis 语义：未注入的属性读一次抛一次；get 回 undefined。
+    const ctx = {
+      ...services,
+      effect(factory: () => unknown) {
+        return factory()
+      },
+      inject() {},
+      get(serviceName: string) {
+        if (serviceName === 'sessionPersistence') return undefined
+        throw new Error(`cannot get property "${serviceName}" without inject`)
+      },
+    }
+    Object.defineProperty(ctx, 'sessionPersistence', {
+      get() {
+        throw new Error('cannot get property "sessionPersistence" without inject')
+      },
+    })
+    apply(ctx, { startupDelayMs: 0, staggerMs: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(prompts.map((call) => call.sessionId)).toEqual(['need-resume'])
+    const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(logged).not.toContain('error:')
+    infoSpy.mockRestore()
+  })
 })
