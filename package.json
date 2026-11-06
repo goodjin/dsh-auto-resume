@@ -1,0 +1,64 @@
+{
+  "name": "@goodjin2/dsh-auto-resume",
+  "version": "0.1.0",
+  "description": "DSH plugin: auto-continue sessions that were abnormally interrupted (crash, network drop, app quit) at desktop startup",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/goodjin/dsh-auto-resume.git"
+  },
+  "homepage": "https://github.com/goodjin/dsh-auto-resume#readme",
+  "bugs": {
+    "url": "https://github.com/goodjin/dsh-auto-resume/issues"
+  },
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.2 <0.3"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/**/*.ts",
+    "README.md",
+    "LICENSE",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "session",
+    "auto-resume",
+    "crash-recovery"
+  ],
+  "author": "goodjin",
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

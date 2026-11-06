@@ -1,0 +1,21 @@
+# 本仓库（@goodjin2/dsh-auto-resume）的挂载配置。
+#
+# 桌面版启动后扫描所有项目下的会话，把因异常原因停掉的（不是用户主动停的）
+# 自动继续：进程被杀/断电留下的开轮次（interrupted）、运行中出错（网络断、超时，
+# error）、桌面版退出时被中断（aborted/disposed）。用户主动停止的（aborted/user）
+# 永不继续。
+#
+# 用法：把下面的 insert 段合并进你的 profile 的 cordis.patch.yml，
+# 并在 profile 的 package.json 里加依赖
+# "@goodjin2/dsh-auto-resume": "link:<本仓库路径>"。
+
+- insert:
+    - id: auto-resume
+      name: '@goodjin2/dsh-auto-resume'
+      config:
+        enabled: true
+        lookbackHours: 24
+        startupDelayMs: 8000
+        staggerMs: 2000
+        includeError: true
+        includeDisposed: true
