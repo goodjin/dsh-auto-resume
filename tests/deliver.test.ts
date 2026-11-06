@@ -17,7 +17,7 @@ function target(partial: Partial<DeliveryTarget>): DeliveryTarget {
 function fakePromptHost(behavior: (request: unknown) => Promise<unknown> = async () => ({ accepted: true })) {
   const calls: unknown[] = []
   const host: PromptHost = {
-    prompt: async (request) => {
+    prompt: async (request, _signal) => {
       calls.push(request)
       return behavior(request)
     },

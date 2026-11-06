@@ -98,7 +98,7 @@ describe('apply 行为', async () => {
         agents: { get: () => undefined },
         workspaceRegistry: { archivedSessionIds: [] },
         sessionController: {
-          prompt: async (request: { sessionId: string }) => {
+          prompt: async (request: { sessionId: string }, _signal?: AbortSignal) => {
             prompts.push(request)
             return { accepted: true }
           },

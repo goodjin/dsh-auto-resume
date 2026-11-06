@@ -20,14 +20,17 @@ export interface DeliveryTarget {
   lastTime: number
 }
 
-/** 投递需要的最小 prompt 面。 */
+/** 投递需要的最小 prompt 面（宿主 Remote 方法的形状：request + signal）。 */
 export interface PromptHost {
-  prompt(request: {
-    requestId: string
-    sessionId: string
-    mode: 'followup'
-    content: Array<{ type: 'text'; text: string }>
-  }): Promise<unknown>
+  prompt(
+    request: {
+      requestId: string
+      sessionId: string
+      mode: 'followup'
+      content: Array<{ type: 'text'; text: string }>
+    },
+    signal: AbortSignal,
+  ): Promise<unknown>
 }
 
 /** 可注入的副作用通道：等待与标识（测试立桩照这个来）。 */
@@ -85,7 +88,14 @@ export async function deliverContinuations(
   return results
 }
 
-/** 投递单个目标；prompt 抛错折成 ok:false 摘要。 */
+/** 单次投递的准入时限：prompt 准入（恢复会话 + 补中断收尾）应当秒级完成，120 秒是兜底。 */
+const PROMPT_ADMISSION_TIMEOUT_MS = 120_000
+
+/**
+ * 投递单个目标；prompt 抛错折成 ok:false 摘要。
+ * 第二个参数是宿主 Remote 方法的 AbortSignal（临时实例实测：缺了它宿主
+ * 第一行 `signal.throwIfAborted()` 就 TypeError）；限时防准入挂死整条节流链。
+ */
 async function deliverOne(
   item: DeliveryTarget,
   promptHost: PromptHost,
@@ -98,12 +108,15 @@ async function deliverOne(
     formatLocalTime(item.lastTime),
   )
   try {
-    await promptHost.prompt({
-      requestId: io.uuid(),
-      sessionId: item.sessionId,
-      mode: 'followup',
-      content: [{ type: 'text', text: message }],
-    })
+    await promptHost.prompt(
+      {
+        requestId: io.uuid(),
+        sessionId: item.sessionId,
+        mode: 'followup',
+        content: [{ type: 'text', text: message }],
+      },
+      AbortSignal.timeout(PROMPT_ADMISSION_TIMEOUT_MS),
+    )
     return { sessionId: item.sessionId, ok: true }
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error)
