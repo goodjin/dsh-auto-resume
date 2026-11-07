@@ -314,8 +314,8 @@ describe('apply 行为：旧版子代理服务（只有 sendMessage）', async (
         },
       },
       subagents: {
-        async sendMessage(parent: unknown, targetId: string, content: string) {
-          sent.push({ parent, targetId, content })
+        async sendMessage(parent: unknown, targetId: string, content: Array<{ text: string }>) {
+          sent.push({ parent, targetId, content: content[0]?.text ?? '' })
           return { messageId: 'm1' }
         },
       },

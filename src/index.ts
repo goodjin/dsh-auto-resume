@@ -93,7 +93,7 @@ interface SubagentsService {
   sendMessage?: (
     sender: unknown,
     targetId: string,
-    content: string,
+    content: Array<{ type: 'text'; text: string }>,
     options: { signal: AbortSignal },
   ) => Promise<unknown>
 }
@@ -229,7 +229,8 @@ function childResumeHostOf(ctx: PluginContext, io: DeliverIo): ChildResumeHost |
           signal,
         )
       }
-      return service.sendMessage?.(parent, childId, content, { signal })
+      // 旧口子的 content 同样是内容块数组（不是纯文本）。
+      return service.sendMessage?.(parent, childId, [{ type: 'text', text: content }], { signal })
     },
   }
 }
