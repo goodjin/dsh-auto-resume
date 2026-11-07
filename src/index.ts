@@ -122,6 +122,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
   // 子代理服务：缺席就不做子会话恢复（父会话照旧续）。
   // 两条取法都留着：服务已在场时 `ctx.get` 直接拿到（宿主自己的代码也这么取），
   // 晚到时 `ctx.inject` 的回调补上。
+  subagentsService = null
   const present = optionalService(ctx, 'subagents')
   if (isSubagentsService(present)) subagentsService = present
   ctx.inject?.(['subagents'], (child) => {

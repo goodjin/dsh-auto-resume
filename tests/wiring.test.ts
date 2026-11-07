@@ -266,10 +266,13 @@ describe('apply 行为：子会话恢复', async () => {
 })
 
 
-describe('apply 行为：旧版子代理服务（只有 sendMessage）', () => {
+describe('apply 行为：旧版子代理服务（只有 sendMessage）', async () => {
   const { apply } = (await import('../src/index.ts')) as {
     apply: (ctx: unknown, config: unknown) => void
   }
+
+  const NOW = new Date('2026-11-07T02:00:00').getTime()
+  const HOUR = 3_600_000
 
   it('没有 queuePrompt 时退回 sendMessage，子会话照样被拉起来', async () => {
     const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
