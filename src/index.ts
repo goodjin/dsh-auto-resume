@@ -12,7 +12,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 
 import { resolveConfig, type ResolvedConfig } from './config.ts'
 import type { ContinueCause } from './classify.ts'
@@ -159,10 +161,21 @@ function recentChannelOf(ctx: PluginContext): RecentEnumeration {
  * `get` 才是缺席回 undefined 的安全口。取不到就让预筛缺席，功能不缺。
  */
 function hostsOf(ctx: PluginContext): ScanHosts {
+  // 归档清单双保险：宿主 registry 之外并上 workspace.json 的持久归档清单
+  // （权威持久层），两边任一记录到都按归档跳过。文件缺失/损坏回空集不拦扫描。
+  const fileArchived = archivedIdsFromFile()
+  const registry: ScanHosts['workspaceRegistry'] = fileArchived.size === 0
+    ? ctx.workspaceRegistry
+    : {
+        archivedSessionIds: Array.from(new Set([
+          ...ctx.workspaceRegistry.archivedSessionIds,
+          ...fileArchived,
+        ])),
+      }
   const hosts: ScanHosts = {
     sessionQuery: ctx.sessionQuery,
     agents: ctx.agents,
-    workspaceRegistry: ctx.workspaceRegistry,
+    workspaceRegistry: registry,
   }
   const persistence = optionalService(ctx, 'sessionPersistence')
   if (persistence !== undefined) {
@@ -204,4 +217,22 @@ function summarize(snapshot: ScanSnapshot): string {
     `continued=[${continued}]`,
     `skips=${JSON.stringify(skips)}`,
   ].join(' ')
+}
+
+/**
+ * 归档清单双保险：直接读 workspace.json 的 `global.archivedSessionIds`
+ * （权威持久层），与宿主 registry 取并集。文件缺失/损坏回空集，
+ * 不影响宿主 registry 这条主通道。
+ */
+function archivedIdsFromFile(): Set<string> {
+  try {
+    const workspaceJson = join(dirname(sessionsRoot()), 'storages', 'workspace.json')
+    const raw = JSON.parse(readFileSync(workspaceJson, 'utf8')) as {
+      global?: { archivedSessionIds?: unknown }
+    }
+    const ids = raw.global?.archivedSessionIds
+    return new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [])
+  } catch {
+    return new Set()
+  }
 }
