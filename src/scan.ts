@@ -68,6 +68,8 @@ export interface ScanLedgerRow {
   lastTime: number
   /** 待恢复的子会话（cause 为 `awaiting-child` 时有值）。 */
   children?: PendingChild[]
+  /** 子会话判定过程中的异常（读不出来等），只为查账，不影响判定。 */
+  childNotes?: Array<{ childId: string; detail: string }>
 }
 
 /** 从判定结果折出账目行。 */
@@ -294,14 +296,20 @@ async function judgeCandidate(
     if (verdict.action === 'continue' || verdict.cause !== 'normal-end') {
       return ledgerRowOfId(sessionId, verdict)
     }
-    const pending = await pendingChildren(hosts, events, options, budget)
-    if (pending.length === 0) return ledgerRowOfId(sessionId, verdict)
+    const { pending, notes } = await pendingChildren(hosts, events, options, budget)
+    if (pending.length === 0) {
+      return {
+        ...ledgerRowOfId(sessionId, verdict),
+        ...(notes.length === 0 ? {} : { childNotes: notes }),
+      }
+    }
     return {
       sessionId,
       action: 'continue',
       cause: 'awaiting-child',
       lastTime: verdict.lastTime,
       children: pending,
+      ...(notes.length === 0 ? {} : { childNotes: notes }),
     }
   } finally {
     observed.observation[Symbol.dispose]?.()
@@ -317,14 +325,21 @@ async function pendingChildren(
   parentEvents: readonly SessionEventLike[],
   options: ClassifyOptions,
   budget: { left: number },
-): Promise<PendingChild[]> {
+): Promise<{ pending: PendingChild[]; notes: Array<{ childId: string; detail: string }> }> {
   const pending: PendingChild[] = []
+  const notes: Array<{ childId: string; detail: string }> = []
   for (const child of catalogChildren(parentEvents)) {
     if (budget.left <= 0) break
-    if (!hasLocalSession(child)) continue
+    if (!hasLocalSession(child)) {
+      notes.push({ childId: child.childId, detail: '外部后端子会话，没有本地会话日志' })
+      continue
+    }
     budget.left -= 1
     const observed = await observeTimed(hosts, child.childId)
-    if (!observed.ok) continue
+    if (!observed.ok) {
+      notes.push({ childId: child.childId, detail: observed.detail })
+      continue
+    }
     try {
       const verdict = childNeedsResume(observed.observation.events, options)
       if (verdict.needs && verdict.cause !== undefined) {
@@ -334,7 +349,7 @@ async function pendingChildren(
       observed.observation[Symbol.dispose]?.()
     }
   }
-  return pending
+  return { pending, notes }
 }
 
 /** 快速通道：fs 直查候选 → 运行中/归档过滤 → 带超时观察判定。 */
