@@ -73,15 +73,29 @@ let latestSnapshot: ScanSnapshot | null = null
  */
 let subagentsService: SubagentsService | null = null
 
-/** 子代理服务需要的最小面（测试立桩照这个来）。 */
+/**
+ * 子代理服务需要的最小面（测试立桩照这个来）。
+ *
+ * 两个宿主版本的口子不同：
+ * - 新版（dsh 0.2.2+）有 `queuePrompt`：把一条**人写的**提示排进子会话收件箱；
+ * - 旧版（0.2.1）只有 `sendMessage`：模型/宿主写的消息，子会话不在内存里时同样
+ *   按它的日志冷恢复。
+ * 两者对「被中断的子会话」都成立：新口子更贴语义（人写的），旧口子兜底。
+ */
 interface SubagentsService {
-  queuePrompt(
+  queuePrompt?: (
     parent: unknown,
     childId: string,
     content: Array<{ type: 'text'; text: string }>,
     source: { kind: string; rpcId: string },
     signal: AbortSignal,
-  ): Promise<unknown>
+  ) => Promise<unknown>
+  sendMessage?: (
+    sender: unknown,
+    targetId: string,
+    content: string,
+    options: { signal: AbortSignal },
+  ) => Promise<unknown>
 }
 
 /**
@@ -204,24 +218,26 @@ function childResumeHostOf(ctx: PluginContext, io: DeliverIo): ChildResumeHost |
   const service = subagentsService
   return {
     parentAgent: (sessionId: string) => ctx.agents.get(sessionId),
-    queueChildPrompt: async (parent, childId, content, signal) =>
-      service.queuePrompt(
-        parent,
-        childId,
-        [{ type: 'text', text: content }],
-        { kind: 'user', rpcId: io.uuid() },
-        signal,
-      ),
+    queueChildPrompt: async (parent, childId, content, signal) => {
+      if (typeof service.queuePrompt === 'function') {
+        return service.queuePrompt(
+          parent,
+          childId,
+          [{ type: 'text', text: content }],
+          { kind: 'user', rpcId: io.uuid() },
+          signal,
+        )
+      }
+      return service.sendMessage?.(parent, childId, content, { signal })
+    },
   }
 }
 
-/** 子代理服务形状检查：认得 queuePrompt 才算可用。 */
+/** 子代理服务形状检查：认得投递口子（queuePrompt / sendMessage 任一）才算可用。 */
 function isSubagentsService(service: unknown): service is SubagentsService {
-  return (
-    typeof service === 'object' &&
-    service !== null &&
-    typeof (service as { queuePrompt?: unknown }).queuePrompt === 'function'
-  )
+  if (typeof service !== 'object' || service === null) return false
+  const candidate = service as { queuePrompt?: unknown; sendMessage?: unknown }
+  return typeof candidate.queuePrompt === 'function' || typeof candidate.sendMessage === 'function'
 }
 
 /** 日志路径 → mtime 毫秒；文件消失等错误折成 undefined（该会话照常整读）。 */

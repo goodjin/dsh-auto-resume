@@ -264,3 +264,72 @@ describe('apply 行为：子会话恢复', async () => {
     infoSpy.mockRestore()
   })
 })
+
+
+describe('apply 行为：旧版子代理服务（只有 sendMessage）', () => {
+  const { apply } = (await import('../src/index.ts')) as {
+    apply: (ctx: unknown, config: unknown) => void
+  }
+
+  it('没有 queuePrompt 时退回 sendMessage，子会话照样被拉起来', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const sent: Array<{ parent: unknown; targetId: string; content: string }> = []
+    const services: Record<string, unknown> = {
+      sessionQuery: {
+        async listSessions() {
+          return [{ header: { id: 'parent' } }]
+        },
+        async observeSession(id: string) {
+          return {
+            events:
+              id === 'child-1'
+                ? [
+                    { type: 'turn/start', time: NOW - 2 * HOUR },
+                    { type: 'turn/end', time: NOW - 2 * HOUR, data: { turn: 1, reason: { kind: 'interrupted' } } },
+                  ]
+                : [
+                    { type: 'turn/start', time: NOW - 3 * HOUR },
+                    { type: 'turn/end', time: NOW - 3 * HOUR, data: { turn: 1, reason: { kind: 'completed' } } },
+                    {
+                      type: 'subagent/catalog',
+                      time: NOW - 2 * HOUR,
+                      data: { version: 0, childId: 'child-1', childCreatedAt: NOW - 2 * HOUR, mode: 'continuable', label: '子任务' },
+                    },
+                  ],
+          }
+        },
+      },
+      agents: {
+        get(id: string) {
+          return id === 'parent' ? { id: 'parent' } : undefined
+        },
+      },
+      workspaceRegistry: { archivedSessionIds: [] },
+      sessionRecent: {
+        async listRecent() {
+          return [{ sessionId: 'parent', mtime: NOW - HOUR }]
+        },
+      },
+      subagents: {
+        async sendMessage(parent: unknown, targetId: string, content: string) {
+          sent.push({ parent, targetId, content })
+          return { messageId: 'm1' }
+        },
+      },
+      sessionController: {
+        async prompt() {
+          return { accepted: true }
+        },
+      },
+    }
+    const { ctx } = makeCtx(services)
+    apply(ctx, { startupDelayMs: 0, staggerMs: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(sent.map((call) => call.targetId)).toEqual(['child-1'])
+    expect(sent[0]?.content).toContain('parent')
+    const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(logged).toContain('children=service:present')
+    expect(logged).toContain('resumed=1/1')
+    infoSpy.mockRestore()
+  })
+})
