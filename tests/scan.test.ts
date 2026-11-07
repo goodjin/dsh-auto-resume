@@ -298,3 +298,31 @@ describe('scanSessions：主会话在等子会话', () => {
     expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({ action: 'skip', cause: 'normal-end' })
   })
 })
+
+
+describe('scanSessions：子会话观察顺序', () => {
+  it('目录里最晚创建的子会话先被观察（预算有限时先看它）', async () => {
+    const observed: string[] = []
+    const events = (id: string): SessionEventLike[] => [
+      { type: 'turn/start', time: NOW - 3 * HOUR },
+      { type: 'turn/end', time: NOW - 3 * HOUR, data: { turn: 1, reason: { kind: 'completed' } } },
+      {
+        type: 'subagent/catalog',
+        time: NOW - 2 * HOUR,
+        data: { version: 0, childId: id, childCreatedAt: NOW - 2 * HOUR, mode: 'continuable', label: '子任务' },
+      },
+    ]
+    const hosts = makeHosts({
+      listSessions: listing('parent'),
+      observeSession: async (id: string) => {
+        observed.push(id)
+        if (id === 'parent') {
+          return { events: [...events('old-child'), ...events('new-child')] }
+        }
+        return { events: [] }
+      },
+    })
+    await scanSessions(hosts, { ...OPTS, maxChildObservations: 1 }, RECENT_MTIME)
+    expect(observed.filter((id) => id !== 'parent')).toEqual(['new-child'])
+  })
+})

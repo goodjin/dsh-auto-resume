@@ -328,7 +328,10 @@ async function pendingChildren(
 ): Promise<{ pending: PendingChild[]; notes: Array<{ childId: string; detail: string }> }> {
   const pending: PendingChild[] = []
   const notes: Array<{ childId: string; detail: string }> = []
-  for (const child of catalogChildren(parentEvents)) {
+  // 目录按创建顺序追加，**新的在后面**：被中断的通常是最新的那个，所以倒着看，
+  // 观察预算有限时先看它。
+  const children = [...catalogChildren(parentEvents)].reverse()
+  for (const child of children) {
     if (budget.left <= 0) break
     if (!hasLocalSession(child)) {
       notes.push({ childId: child.childId, detail: '外部后端子会话，没有本地会话日志' })
