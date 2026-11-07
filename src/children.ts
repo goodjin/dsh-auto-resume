@@ -1,0 +1,82 @@
+/**
+ * 子会话（子代理）识别：父会话在等一个被中断的子会话。
+ *
+ * 场景（2026-11-07 现场）：主会话已经输出完回答块、正在等子会话主动回话，
+ * 此时退出应用——主会话那一轮是**正常结束**的（宿主教模型「只剩等子代理结果
+ * 时就结束本轮」），所以按会话级判定会被当成「正常结束」跳过，重启后没人
+ * 再把它叫醒，子会话的活儿也停在半路。
+ *
+ * 判断依据全在日志里：
+ * - 父会话的 `subagent/catalog` 事实记录了它有哪些子会话（只记成员关系，
+ *   不记执行状态）；
+ * - 子会话自己的日志尾部说了算：轮次还开着 → 宿主冷读补出的收尾是
+ *   `interrupted`（被杀）/ `disposed`（退出）→ 属于异常中断，值得续。
+ *
+ * @module @goodjin2/dsh-auto-resume/children
+ */
+
+import { classifySession, type ClassifyOptions, type ContinueCause, type SessionEventLike } from './classify.ts'
+
+/** 父会话目录里的一个子会话。 */
+export interface CatalogChild {
+  childId: string
+  /** 本地可继续 / 外部后端（外部后端不可继续，只能让父会话重新委派）。 */
+  mode?: string
+  createdAt?: number
+}
+
+/** 一个待恢复的子会话。 */
+export interface PendingChild {
+  childId: string
+  /** 子会话自己的中断原因（interrupted / disposed / error …）。 */
+  cause: ContinueCause
+}
+
+/**
+ * 从父会话的事件流里取出子代理目录。
+ * 每创建一个子会话，宿主就往父会话追加一条 `subagent/catalog` 事实。
+ */
+export function catalogChildren(events: readonly SessionEventLike[]): CatalogChild[] {
+  const children: CatalogChild[] = []
+  const seen = new Set<string>()
+  for (const event of events) {
+    if (event.type !== 'subagent/catalog') continue
+    const data = event.data
+    if (typeof data !== 'object' || data === null) continue
+    const record = data as Record<string, unknown>
+    const childId = record.childId
+    if (typeof childId !== 'string' || childId === '' || seen.has(childId)) continue
+    seen.add(childId)
+    const mode = record.mode
+    const createdAt = record.childCreatedAt
+    children.push({
+      childId,
+      ...(typeof mode === 'string' ? { mode } : {}),
+      ...(typeof createdAt === 'number' ? { createdAt } : {}),
+    })
+  }
+  return children
+}
+
+/**
+ * 子会话是否值得恢复：它自己的判定结果是「该续」才算。
+ * 正常结束、用户主动停过、空白会话都算不用管。
+ */
+export function childNeedsResume(
+  events: readonly SessionEventLike[],
+  options: ClassifyOptions,
+): { needs: boolean; cause?: ContinueCause } {
+  const verdict = classifySession(events, options)
+  if (verdict.action !== 'continue') return { needs: false }
+  return { needs: true, cause: verdict.cause }
+}
+
+/**
+ * 外部后端（Codex / Claude Code / ACP 等）的子会话没有本地会话日志，
+ * 不可继续，只能让父会话重新委派。目录里的 `mode: 'external'` 就是这种。
+ * 其余（含 `unknown` 的历史条目）都交给宿主判定——它按子会话自己的描述符
+ * 决定能不能冷恢复。
+ */
+export function hasLocalSession(child: CatalogChild): boolean {
+  return child.mode !== 'external'
+}

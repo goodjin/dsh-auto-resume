@@ -19,7 +19,15 @@ export interface AutoResumeConfig {
   includeError?: boolean
   includeDisposed?: boolean
   maxObservations?: number
+  /** 是否恢复被中断的子会话（经父会话的子代理路由正门）。 */
+  resumeChildren?: boolean
+  /** 判定阶段最多读多少个子会话日志。 */
+  maxChildObservations?: number
+  /** 一次启动最多恢复多少个子会话。 */
+  maxChildResumes?: number
   messageTemplate?: string
+  /** 给子会话的继续消息模板（{parent}/{reason}/{time} 占位符）。 */
+  childMessageTemplate?: string
 }
 
 /** 解析完成后扫描编排实际消费的形状（字段全部必有）。 */
@@ -31,13 +39,23 @@ export interface ResolvedConfig {
   includeError: boolean
   includeDisposed: boolean
   maxObservations: number
+  resumeChildren: boolean
+  maxChildObservations: number
+  maxChildResumes: number
   messageTemplate: string
+  childMessageTemplate: string
 }
 
 /** 继续消息默认模板：{reason} 换人话原因，{time} 换本地时间。 */
 export const DEFAULT_MESSAGE_TEMPLATE = [
   '【自动恢复】检测到本会话上次因异常中断而停止（原因：{reason}，时间：{time}）。',
   '请从中断处继续完成任务。如果任务其实已完成或已不再需要，请简要说明现状后结束，不要重新开始已做完的工作。',
+].join('\n')
+
+/** 给子会话的默认继续消息：{parent} 换父会话 id，{reason}/{time} 同父会话模板。 */
+export const DEFAULT_CHILD_MESSAGE_TEMPLATE = [
+  '【自动恢复】你在父会话 {parent} 的委派中途被中断（原因：{reason}，时间：{time}）。',
+  '请从中断处继续完成原任务。如果任务其实已完成或已不再需要，请简要说明现状后结束，不要重新开始已做完的工作。',
 ].join('\n')
 
 /** 挂载行 config 的宿主 schema（check-host-rows 用它校验行的 config）。 */
@@ -49,7 +67,11 @@ export const Config: Schema<AutoResumeConfig> = Schema.object({
   includeError: Schema.boolean().default(true),
   includeDisposed: Schema.boolean().default(true),
   maxObservations: Schema.number().default(30),
+  resumeChildren: Schema.boolean().default(true),
+  maxChildObservations: Schema.number().default(20),
+  maxChildResumes: Schema.number().default(10),
   messageTemplate: Schema.string().default(DEFAULT_MESSAGE_TEMPLATE),
+  childMessageTemplate: Schema.string().default(DEFAULT_CHILD_MESSAGE_TEMPLATE),
 })
 
 /** 数值钳位：非数值回默认，负数取 0（窗口与延时不存在负值语义）。 */
@@ -77,10 +99,17 @@ export function resolveConfig(raw: unknown): ResolvedConfig {
     includeError: booleanOr(source.includeError, true),
     includeDisposed: booleanOr(source.includeDisposed, true),
     maxObservations: nonNegative(source.maxObservations, 30),
+    resumeChildren: booleanOr(source.resumeChildren, true),
+    maxChildObservations: nonNegative(source.maxChildObservations, 20),
+    maxChildResumes: nonNegative(source.maxChildResumes, 10),
     messageTemplate:
       typeof source.messageTemplate === 'string' && source.messageTemplate.trim() !== ''
         ? source.messageTemplate
         : DEFAULT_MESSAGE_TEMPLATE,
+    childMessageTemplate:
+      typeof source.childMessageTemplate === 'string' && source.childMessageTemplate.trim() !== ''
+        ? source.childMessageTemplate
+        : DEFAULT_CHILD_MESSAGE_TEMPLATE,
   }
 }
 

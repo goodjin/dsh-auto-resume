@@ -20,7 +20,7 @@ import { resolveConfig, type ResolvedConfig } from './config.ts'
 import type { ContinueCause } from './classify.ts'
 import { scanSessions, type RecentEnumeration, type ScanHosts, type ScanLedgerRow } from './scan.ts'
 import { listRecentByFs, sessionsRoot } from './recent.ts'
-import { deliverContinuations, type DeliveryResult, type DeliverIo, type PromptHost } from './deliver.ts'
+import { deliverContinuations, type ChildResumeHost, type DeliveryResult, type DeliverIo, type PromptHost } from './deliver.ts'
 import { registerHealthRoute, type HealthRouteContext } from './route.ts'
 
 export { Config } from './config.ts'
@@ -50,20 +50,65 @@ export interface ScanSnapshot {
   config: ResolvedConfig
   rows: ScanLedgerRow[]
   deliveries: DeliveryResult[]
+  /** 子会话恢复的自报状态：服务在不在、恢复了谁。 */
+  children: ChildReport
+}
+
+/** 子会话恢复的账目（路由自报用）。 */
+export interface ChildReport {
+  /** 子代理服务是否可用（不可用时只能续父会话）。 */
+  serviceAvailable: boolean
+  /** 判定阶段认定「被中断、值得恢复」的子会话数。 */
+  pending: number
+  /** 实际投递结果。 */
+  resumed: Array<{ parentId: string; childId: string; ok: boolean; detail?: string }>
 }
 
 /** 最近一次启动扫描的快照（进程内，随装载生命周期）。 */
 let latestSnapshot: ScanSnapshot | null = null
 
 /**
+ * 子代理服务（`ctx.subagents`）：子会话恢复的正门。
+ * 走 `ctx.inject` 机会式取用——服务在场才启用子会话恢复，缺席就只续父会话。
+ */
+let subagentsService: SubagentsService | null = null
+
+/** 子代理服务需要的最小面（测试立桩照这个来）。 */
+interface SubagentsService {
+  queuePrompt(
+    parent: unknown,
+    childId: string,
+    content: Array<{ type: 'text'; text: string }>,
+    source: { kind: string; rpcId: string },
+    signal: AbortSignal,
+  ): Promise<unknown>
+}
+
+/**
  * 装载入口：挂账目路由；enabled 时排一次启动扫描。
  */
 export function apply(ctx: PluginContext, rawConfig: unknown): void {
   const config = resolveConfig(rawConfig)
-  latestSnapshot = { enabled: config.enabled, startedAt: null, finishedAt: null, scanned: 0, total: 0, config, rows: [], deliveries: [] }
+  latestSnapshot = {
+    enabled: config.enabled,
+    startedAt: null,
+    finishedAt: null,
+    scanned: 0,
+    total: 0,
+    config,
+    rows: [],
+    deliveries: [],
+    children: { serviceAvailable: false, pending: 0, resumed: [] },
+  }
 
   ctx.inject?.(['webServer'], (child) => {
     registerHealthRoute(child as HealthRouteContext, () => latestSnapshot)
+  })
+
+  // 子代理服务：缺席就不做子会话恢复（父会话照旧续）。
+  ctx.inject?.(['subagents'], (child) => {
+    const service = (child as { subagents?: unknown }).subagents
+    if (isSubagentsService(service)) subagentsService = service
   })
 
   if (!config.enabled) return
@@ -94,6 +139,7 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
       includeError: config.includeError,
       includeDisposed: config.includeDisposed,
       maxObservations: config.maxObservations,
+      maxChildObservations: config.resumeChildren ? config.maxChildObservations : 0,
     },
     { statMtime: statMtimeMs },
     (scanned, total) => {
@@ -109,23 +155,69 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
       cause: row.cause as ContinueCause,
       ...(row.detail === undefined ? {} : { detail: row.detail }),
       lastTime: row.lastTime,
+      ...(row.children === undefined ? {} : { children: row.children }),
     }))
   const deliverIo: DeliverIo = {
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     uuid: () => randomUUID(),
   }
+  const childResume = childResumeHostOf(ctx, deliverIo)
   const deliveries = await deliverContinuations(
     targets,
     ctx.sessionController,
     config.messageTemplate,
     config.staggerMs,
     deliverIo,
+    config.resumeChildren ? childResume : undefined,
+    config.childMessageTemplate,
+    config.maxChildResumes,
   )
 
   snapshot.rows = rows
   snapshot.deliveries = deliveries
+  snapshot.children = {
+    serviceAvailable: subagentsService !== null,
+    pending: rows.reduce((sum, row) => sum + (row.children?.length ?? 0), 0),
+    resumed: deliveries.flatMap((delivery) =>
+      (delivery.children ?? []).map((child) => ({
+        parentId: delivery.sessionId,
+        childId: child.childId,
+        ok: child.ok,
+        ...(child.detail === undefined ? {} : { detail: child.detail }),
+      })),
+    ),
+  }
   snapshot.finishedAt = Date.now()
   console.info(summarize(snapshot))
+}
+
+/**
+ * 子会话恢复通道：父 agent 在线时，经子代理服务把提示排进子会话。
+ * 服务缺席时回 undefined——只续父会话，不做子会话恢复。
+ */
+function childResumeHostOf(ctx: PluginContext, io: DeliverIo): ChildResumeHost | undefined {
+  if (subagentsService === null) return undefined
+  const service = subagentsService
+  return {
+    parentAgent: (sessionId: string) => ctx.agents.get(sessionId),
+    queueChildPrompt: async (parent, childId, content, signal) =>
+      service.queuePrompt(
+        parent,
+        childId,
+        [{ type: 'text', text: content }],
+        { kind: 'user', rpcId: io.uuid() },
+        signal,
+      ),
+  }
+}
+
+/** 子代理服务形状检查：认得 queuePrompt 才算可用。 */
+function isSubagentsService(service: unknown): service is SubagentsService {
+  return (
+    typeof service === 'object' &&
+    service !== null &&
+    typeof (service as { queuePrompt?: unknown }).queuePrompt === 'function'
+  )
 }
 
 /** 日志路径 → mtime 毫秒；文件消失等错误折成 undefined（该会话照常整读）。 */
@@ -209,6 +301,8 @@ function summarize(snapshot: ScanSnapshot): string {
     skips[row.cause] = (skips[row.cause] ?? 0) + 1
   }
   const delivered = snapshot.deliveries.filter((delivery) => delivery.ok).length
+  const childRows = snapshot.children.resumed
+  const childOk = childRows.filter((child) => child.ok).length
   return [
     `auto-resume:`,
     `scanned=${snapshot.rows.length}`,
@@ -216,6 +310,10 @@ function summarize(snapshot: ScanSnapshot): string {
     `delivered=${delivered}/${snapshot.deliveries.length}`,
     `continued=[${continued}]`,
     `skips=${JSON.stringify(skips)}`,
+    `children=service:${snapshot.children.serviceAvailable ? 'present' : 'absent'}`,
+    `pending=${snapshot.children.pending}`,
+    `resumed=${childOk}/${childRows.length}`,
+    `childIds=[${childRows.map((child) => `${child.childId}${child.ok ? '' : ':失败'}`).join(',')}]`,
   ].join(' ')
 }
 

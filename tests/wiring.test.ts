@@ -59,7 +59,11 @@ function makeCtx(services: Record<string, unknown>) {
     },
     inject(deps: string[], body: (child: unknown) => void) {
       injectCalls.push(deps)
-      body({ webServer: { register: (route: unknown) => route }, effect: (factory: () => unknown) => factory() })
+      body({
+        webServer: { register: (route: unknown) => route },
+        effect: (factory: () => unknown) => factory(),
+        ...(services.subagents === undefined ? {} : { subagents: services.subagents }),
+      })
     },
   }
   return { ctx, disposers, injectCalls }
@@ -127,7 +131,7 @@ describe('apply 行为', async () => {
     const { ctx, injectCalls } = makeCtx(fakeServices().services)
     apply(ctx, { enabled: false, startupDelayMs: 0 })
     await new Promise((resolve) => setTimeout(resolve, 20))
-    expect(injectCalls).toEqual([['webServer']])
+    expect(injectCalls).toEqual([['webServer'], ['subagents']])
     expect(infoSpy).not.toHaveBeenCalled()
     infoSpy.mockRestore()
   })
@@ -139,7 +143,7 @@ describe('apply 行为', async () => {
     apply(ctx, { startupDelayMs: 0, staggerMs: 0 })
     await new Promise((resolve) => setTimeout(resolve, 30))
     expect(prompts.map((call) => call.sessionId)).toEqual(['need-resume'])
-    expect(injectCalls).toEqual([['webServer']])
+    expect(injectCalls).toEqual([['webServer'], ['subagents']])
     const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
     expect(logged).toContain('auto-resume:')
     expect(logged).toContain('need-resume')
@@ -181,5 +185,82 @@ describe('apply 行为', async () => {
     const logged = errorSpy.mock.calls.map((args) => args.join(' ')).join('\n')
     expect(logged).toContain('enumeration offline')
     errorSpy.mockRestore()
+  })
+})
+
+
+describe('apply 行为：子会话恢复', async () => {
+  const { apply } = (await import('../src/index.ts')) as {
+    apply: (ctx: unknown, config: unknown) => void
+  }
+
+  const NOW = new Date('2026-11-07T02:00:00').getTime()
+  const HOUR = 3_600_000
+
+  /** 父会话：一轮正常结束 + 子代理目录事实。 */
+  const parentEvents = [
+    { type: 'turn/start', time: NOW - 3 * HOUR },
+    { type: 'turn/end', time: NOW - 3 * HOUR, data: { turn: 1, reason: { kind: 'completed' } } },
+    {
+      type: 'subagent/catalog',
+      time: NOW - 2 * HOUR,
+      data: { version: 0, childId: 'child-1', childCreatedAt: NOW - 2 * HOUR, mode: 'continuable', label: '子任务' },
+    },
+  ]
+
+  /** 子会话：轮次被中断。 */
+  const childEvents = [
+    { type: 'turn/start', time: NOW - 2 * HOUR },
+    { type: 'turn/end', time: NOW - 2 * HOUR, data: { turn: 1, reason: { kind: 'interrupted' } } },
+  ]
+
+  it('父会话被叫醒后，被中断的子会话经子代理服务被拉起来', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const prompts: Array<{ sessionId: string }> = []
+    const queued: Array<{ parent: unknown; childId: string; content: string }> = []
+    const services: Record<string, unknown> = {
+      sessionQuery: {
+        async listSessions() {
+          return [{ header: { id: 'parent' } }]
+        },
+        async observeSession(id: string) {
+          return { events: id === 'child-1' ? childEvents : parentEvents }
+        },
+      },
+      agents: {
+        get(id: string) {
+          return id === 'parent' ? { id: 'parent' } : undefined
+        },
+      },
+      workspaceRegistry: { archivedSessionIds: [] },
+      sessionRecent: {
+        async listRecent() {
+          return [{ sessionId: 'parent', mtime: NOW - HOUR }]
+        },
+      },
+      subagents: {
+        async queuePrompt(parent: unknown, childId: string, content: Array<{ text: string }>) {
+          queued.push({ parent, childId, content: content[0]?.text ?? '' })
+          return { messageId: 'm1' }
+        },
+      },
+      sessionController: {
+        async prompt(request: { sessionId: string }) {
+          prompts.push(request)
+          return { accepted: true }
+        },
+      },
+    }
+    const { ctx } = makeCtx(services)
+    apply(ctx, { startupDelayMs: 0, staggerMs: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(prompts.map((call) => call.sessionId)).toEqual(['parent'])
+    expect(queued.map((call) => call.childId)).toEqual(['child-1'])
+    expect(queued[0]?.parent).toEqual({ id: 'parent' })
+    const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(logged).toContain('children=service:present')
+    expect(logged).toContain('pending=1')
+    expect(logged).toContain('resumed=1/1')
+    infoSpy.mockRestore()
   })
 })

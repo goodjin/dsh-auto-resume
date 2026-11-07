@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import { deliverContinuations, type DeliveryTarget, type PromptHost } from '../src/deliver.ts'
-import { DEFAULT_MESSAGE_TEMPLATE } from '../src/config.ts'
+import { deliverContinuations, type ChildResumeHost, type DeliveryTarget, type PromptHost } from '../src/deliver.ts'
+import { DEFAULT_CHILD_MESSAGE_TEMPLATE, DEFAULT_MESSAGE_TEMPLATE } from '../src/config.ts'
 
 const NOW = new Date('2026-11-07T02:00:00').getTime()
 
@@ -122,5 +122,163 @@ describe('deliverContinuations：空目标', () => {
       uuid: () => 'u',
     })
     expect(sleep).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('deliverContinuations：子会话恢复', () => {
+  /** 假子会话通道：记录父 agent、子会话 id 与提示文本。 */
+  function fakeChildResume(parentAgent: unknown = { id: 'parent' }) {
+    const calls: Array<{ parent: unknown; childId: string; content: string }> = []
+    const host: ChildResumeHost = {
+      parentAgent: () => parentAgent,
+      queueChildPrompt: async (parent, childId, content) => {
+        calls.push({ parent, childId, content })
+        return { messageId: 'm1' }
+      },
+    }
+    return { host, calls }
+  }
+
+  it('父会话先投、父 agent 上线后再把子会话拉起来', async () => {
+    const { host, calls } = fakePromptHost()
+    const { host: childHost, calls: childCalls } = fakeChildResume()
+    const order: string[] = []
+    const promptHost: PromptHost = {
+      prompt: async (request, signal) => {
+        order.push(`prompt:${request.sessionId}`)
+        return host.prompt(request, signal)
+      },
+    }
+    const results = await deliverContinuations(
+      [
+        target({
+          sessionId: 'parent',
+          cause: 'awaiting-child',
+          children: [
+            { childId: 'child-1', cause: 'interrupted' },
+            { childId: 'child-2', cause: 'disposed' },
+          ],
+        }),
+      ],
+      promptHost,
+      DEFAULT_MESSAGE_TEMPLATE,
+      0,
+      realIo(),
+      childHost,
+      DEFAULT_CHILD_MESSAGE_TEMPLATE,
+    )
+    expect(order).toEqual(['prompt:parent'])
+    expect(childCalls.map((call) => call.childId)).toEqual(['child-1', 'child-2'])
+    expect(childCalls[0]?.content).toContain('parent')
+    expect(childCalls[0]?.content).toContain('应用退出或进程中断')
+    // 父会话的继续消息要点名子会话，免得模型重新委派一遍
+    const parentText = (calls[0] as { content: Array<{ text: string }> }).content[0]?.text
+    expect(parentText).toContain('child-1')
+    expect(parentText).toContain('不要重复委派')
+    expect(results[0]).toMatchObject({
+      sessionId: 'parent',
+      ok: true,
+      children: [
+        { childId: 'child-1', ok: true },
+        { childId: 'child-2', ok: true },
+      ],
+    })
+  })
+
+  it('父 agent 没上线 → 子会话不投，记明原因（结算通知只送给在线的父级）', async () => {
+    const { host } = fakePromptHost()
+    const childCalls: Array<{ parent: unknown; childId: string; content: string }> = []
+    const childHost: ChildResumeHost = {
+      parentAgent: () => undefined,
+      queueChildPrompt: async (parent, childId, content) => {
+        childCalls.push({ parent, childId, content })
+        return { messageId: 'm1' }
+      },
+    }
+    const results = await deliverContinuations(
+      [target({ sessionId: 'parent', cause: 'awaiting-child', children: [{ childId: 'child-1', cause: 'interrupted' }] })],
+      host,
+      DEFAULT_MESSAGE_TEMPLATE,
+      0,
+      realIo(),
+      childHost,
+      DEFAULT_CHILD_MESSAGE_TEMPLATE,
+    )
+    expect(childCalls).toHaveLength(0)
+    expect(results[0]?.children?.[0]).toMatchObject({ childId: 'child-1', ok: false })
+    expect(results[0]?.children?.[0]?.detail).toContain('父会话未上线')
+  })
+
+  it('单个子会话投递失败 → 只记该子会话的失败，其余照常', async () => {
+    const { host } = fakePromptHost()
+    const childHost: ChildResumeHost = {
+      parentAgent: () => ({ id: 'parent' }),
+      queueChildPrompt: async (_parent, childId) => {
+        if (childId === 'child-1') throw new Error('NOT_RESUMABLE')
+        return { messageId: 'm' }
+      },
+    }
+    const results = await deliverContinuations(
+      [
+        target({
+          sessionId: 'parent',
+          cause: 'awaiting-child',
+          children: [
+            { childId: 'child-1', cause: 'interrupted' },
+            { childId: 'child-2', cause: 'interrupted' },
+          ],
+        }),
+      ],
+      host,
+      DEFAULT_MESSAGE_TEMPLATE,
+      0,
+      realIo(),
+      childHost,
+      DEFAULT_CHILD_MESSAGE_TEMPLATE,
+    )
+    expect(results[0]?.children).toEqual([
+      { childId: 'child-1', ok: false, detail: 'NOT_RESUMABLE' },
+      { childId: 'child-2', ok: true },
+    ])
+  })
+
+  it('maxChildResumes 限制一次启动恢复的子会话数', async () => {
+    const { host } = fakePromptHost()
+    const { host: childHost, calls: childCalls } = fakeChildResume()
+    await deliverContinuations(
+      [
+        target({
+          sessionId: 'parent',
+          cause: 'awaiting-child',
+          children: [
+            { childId: 'child-1', cause: 'interrupted' },
+            { childId: 'child-2', cause: 'interrupted' },
+            { childId: 'child-3', cause: 'interrupted' },
+          ],
+        }),
+      ],
+      host,
+      DEFAULT_MESSAGE_TEMPLATE,
+      0,
+      realIo(),
+      childHost,
+      DEFAULT_CHILD_MESSAGE_TEMPLATE,
+      2,
+    )
+    expect(childCalls).toHaveLength(2)
+  })
+
+  it('没有子会话通道 → 只投父会话，不影响结果形状', async () => {
+    const { host, calls } = fakePromptHost()
+    const results = await deliverContinuations(
+      [target({ sessionId: 'parent', cause: 'awaiting-child', children: [{ childId: 'child-1', cause: 'interrupted' }] })],
+      host,
+      DEFAULT_MESSAGE_TEMPLATE,
+      0,
+      realIo(),
+    )
+    expect(calls).toHaveLength(1)
+    expect(results[0]).toEqual({ sessionId: 'parent', ok: true })
   })
 })

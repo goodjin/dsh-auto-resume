@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_MESSAGE_TEMPLATE, renderMessage, resolveConfig } from '../src/config.ts'
+import { DEFAULT_CHILD_MESSAGE_TEMPLATE, DEFAULT_MESSAGE_TEMPLATE, renderMessage, resolveConfig } from '../src/config.ts'
 
 describe('resolveConfig：缺省补默认、负数取 0', () => {
   it('空对象得到全部默认值', () => {
@@ -11,7 +11,11 @@ describe('resolveConfig：缺省补默认、负数取 0', () => {
       includeError: true,
       includeDisposed: true,
       maxObservations: 30,
+      resumeChildren: true,
+      maxChildObservations: 20,
+      maxChildResumes: 10,
       messageTemplate: DEFAULT_MESSAGE_TEMPLATE,
+      childMessageTemplate: DEFAULT_CHILD_MESSAGE_TEMPLATE,
     })
   })
 
@@ -21,6 +25,13 @@ describe('resolveConfig：缺省补默认、负数取 0', () => {
     expect(resolved.lookbackHours).toBe(2)
     expect(resolved.staggerMs).toBe(5)
     expect(resolved.startupDelayMs).toBe(8000)
+  })
+
+  it('子会话相关开关可关、可限量', () => {
+    const resolved = resolveConfig({ resumeChildren: false, maxChildObservations: 0, maxChildResumes: 3 })
+    expect(resolved.resumeChildren).toBe(false)
+    expect(resolved.maxChildObservations).toBe(0)
+    expect(resolved.maxChildResumes).toBe(3)
   })
 
   it('负数值取 0', () => {

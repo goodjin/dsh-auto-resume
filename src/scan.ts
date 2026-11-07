@@ -10,6 +10,7 @@
  */
 
 import { classifySession, type ClassifyOptions, type SessionEventLike, type Verdict } from './classify.ts'
+import { catalogChildren, childNeedsResume, hasLocalSession, type PendingChild } from './children.ts'
 import type { RecentCandidate } from './recent.ts'
 
 /** 扫描需要的最小宿主服务面（测试立桩照这个来）。 */
@@ -65,6 +66,8 @@ export interface ScanLedgerRow {
   cause: string
   detail?: string
   lastTime: number
+  /** 待恢复的子会话（cause 为 `awaiting-child` 时有值）。 */
+  children?: PendingChild[]
 }
 
 /** 从判定结果折出账目行。 */
@@ -96,7 +99,7 @@ function skipRow(record: SessionRecordLike, cause: string): ScanLedgerRow {
  */
 export async function scanSessions(
   hosts: ScanHosts,
-  options: ClassifyOptions & { maxObservations: number },
+  options: ClassifyOptions & { maxObservations: number; maxChildObservations: number },
   io: ScanIo,
   progress?: (scanned: number, total: number) => void,
   recent?: RecentEnumeration,
@@ -125,8 +128,13 @@ export async function scanSessions(
   }
   progress?.(scanned, records.length)
   recentCandidates.sort((a, b) => b.mtime - a.mtime)
+  const budget = { left: options.maxChildObservations }
   for (const { record } of recentCandidates.slice(0, Math.max(options.maxObservations, 0))) {
-    rows.push(await observeRow(hosts, options, record))
+    const row = await judgeCandidate(hosts, record.header.id, options, budget)
+    rows.push({
+      ...row,
+      ...(record.header.cwd === undefined ? {} : { cwd: record.header.cwd }),
+    })
   }
   return rows
 }
@@ -167,24 +175,6 @@ async function headRow(
     return { row: skipRow(record, 'pending-observation'), mtime }
   } catch (error) {
     return { row: { ...skipRow(record, `error: ${messageOf(error)}`), lastTime: 0 }, mtime: undefined }
-  }
-}
-
-/** 整读一个候选会话并分类，失败折成 error 行。 */
-async function observeRow(
-  hosts: ScanHosts,
-  options: ClassifyOptions,
-  record: SessionRecordLike,
-): Promise<ScanLedgerRow> {
-  try {
-    const observation = await hosts.sessionQuery.observeSession(record.header.id)
-    try {
-      return ledgerRow(record, classifySession(observation.events, options))
-    } finally {
-      observation[Symbol.dispose]?.()
-    }
-  } catch (error) {
-    return { ...skipRow(record, `error: ${messageOf(error)}`), lastTime: 0 }
   }
 }
 
@@ -240,6 +230,29 @@ async function observeRowTimed(
   sessionId: string,
   options: ClassifyOptions,
 ): Promise<ScanLedgerRow> {
+  const observed = await observeTimed(hosts, sessionId)
+  if (!observed.ok) {
+    return { sessionId, action: 'skip', cause: `error: ${observed.detail}`, lastTime: 0 }
+  }
+  try {
+    // 子代理会话归父会话路由管：观察租约带头，头里认得出就当场跳过，
+    // 免得投一次被宿主回「owned by subagent routing」。
+    if (isSubagentHeader(observed.observation.header)) {
+      return { sessionId, action: 'skip', cause: 'subagent', lastTime: 0 }
+    }
+    return ledgerRowOfId(sessionId, classifySession(observed.observation.events, options))
+  } finally {
+    observed.observation[Symbol.dispose]?.()
+  }
+}
+
+/** 一次带硬超时的观察结果（失败带一句摘要）。 */
+type TimedObservation =
+  | { ok: true; observation: SessionObservationLike }
+  | { ok: false; detail: string }
+
+/** 带硬超时的观察：拿不到就折成失败摘要，不抛。 */
+async function observeTimed(hosts: ScanHosts, sessionId: string): Promise<TimedObservation> {
   try {
     const observation = await Promise.race([
       hosts.sessionQuery.observeSession(sessionId),
@@ -248,25 +261,86 @@ async function observeRowTimed(
         timer.unref?.()
       }),
     ])
-    try {
-      // 子代理会话归父会话路由管：观察租约带头，头里认得出就当场跳过，
-      // 免得投一次被宿主回「owned by subagent routing」。
-      if (isSubagentHeader(observation.header)) {
-        return { sessionId, action: 'skip', cause: 'subagent', lastTime: 0 }
-      }
-      return ledgerRowOfId(sessionId, classifySession(observation.events, options))
-    } finally {
-      observation[Symbol.dispose]?.()
-    }
+    return { ok: true, observation }
   } catch (error) {
-    return { sessionId, action: 'skip', cause: `error: ${messageOf(error)}`, lastTime: 0 }
+    return { ok: false, detail: messageOf(error) }
   }
+}
+
+/**
+ * 判定一个候选会话，并回答「主会话是不是在等一个被中断的子会话」。
+ *
+ * 主会话自己异常收尾 → 照旧续它；
+ * 主会话正常收尾（模型结束轮次去等子代理）→ 看它的子代理目录：若某个子会话
+ * 自己也是异常收尾且没交过结算，那这就是「等子会话」的形态 → 主会话也要叫醒，
+ * 并把那些子会话一并恢复（cause: awaiting-child）。
+ */
+async function judgeCandidate(
+  hosts: ScanHosts,
+  sessionId: string,
+  options: ClassifyOptions & { maxChildObservations: number },
+  budget: { left: number },
+): Promise<ScanLedgerRow> {
+  const observed = await observeTimed(hosts, sessionId)
+  if (!observed.ok) {
+    return { sessionId, action: 'skip', cause: `error: ${observed.detail}`, lastTime: 0 }
+  }
+  try {
+    if (isSubagentHeader(observed.observation.header)) {
+      return { sessionId, action: 'skip', cause: 'subagent', lastTime: 0 }
+    }
+    const events = observed.observation.events
+    const verdict = classifySession(events, options)
+    if (verdict.action === 'continue' || verdict.cause !== 'normal-end') {
+      return ledgerRowOfId(sessionId, verdict)
+    }
+    const pending = await pendingChildren(hosts, events, options, budget)
+    if (pending.length === 0) return ledgerRowOfId(sessionId, verdict)
+    return {
+      sessionId,
+      action: 'continue',
+      cause: 'awaiting-child',
+      lastTime: verdict.lastTime,
+      children: pending,
+    }
+  } finally {
+    observed.observation[Symbol.dispose]?.()
+  }
+}
+
+/**
+ * 找出父会话下「被中断、值得恢复」的子会话。
+ * 子会话的日志说了算：轮次还开着（宿主冷读补 `interrupted`）或异常收尾 → 续。
+ */
+async function pendingChildren(
+  hosts: ScanHosts,
+  parentEvents: readonly SessionEventLike[],
+  options: ClassifyOptions,
+  budget: { left: number },
+): Promise<PendingChild[]> {
+  const pending: PendingChild[] = []
+  for (const child of catalogChildren(parentEvents)) {
+    if (budget.left <= 0) break
+    if (!hasLocalSession(child)) continue
+    budget.left -= 1
+    const observed = await observeTimed(hosts, child.childId)
+    if (!observed.ok) continue
+    try {
+      const verdict = childNeedsResume(observed.observation.events, options)
+      if (verdict.needs && verdict.cause !== undefined) {
+        pending.push({ childId: child.childId, cause: verdict.cause })
+      }
+    } finally {
+      observed.observation[Symbol.dispose]?.()
+    }
+  }
+  return pending
 }
 
 /** 快速通道：fs 直查候选 → 运行中/归档过滤 → 带超时观察判定。 */
 async function scanViaRecent(
   hosts: ScanHosts,
-  options: ClassifyOptions & { maxObservations: number },
+  options: ClassifyOptions & { maxObservations: number; maxChildObservations: number },
   recent: RecentEnumeration,
   progress?: (scanned: number, total: number) => void,
 ): Promise<ScanLedgerRow[]> {
@@ -274,6 +348,7 @@ async function scanViaRecent(
   progress?.(0, candidates.length)
   const archived = new Set(hosts.workspaceRegistry.archivedSessionIds)
   const rows: ScanLedgerRow[] = []
+  const budget = { left: options.maxChildObservations }
   let scanned = 0
   for (const candidate of candidates) {
     scanned += 1
@@ -288,7 +363,7 @@ async function scanViaRecent(
       progress?.(scanned, candidates.length)
       continue
     }
-    rows.push(await observeRowTimed(hosts, candidate.sessionId, options))
+    rows.push(await judgeCandidate(hosts, candidate.sessionId, options, budget))
     progress?.(scanned, candidates.length)
   }
   return rows

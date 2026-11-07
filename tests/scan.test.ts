@@ -4,7 +4,14 @@ import type { SessionEventLike } from '../src/classify.ts'
 
 const NOW = new Date('2026-11-07T02:00:00').getTime()
 const HOUR = 3_600_000
-const OPTS = { now: NOW, lookbackHours: 24, includeError: true, includeDisposed: true, maxObservations: 30 }
+const OPTS = {
+  now: NOW,
+  lookbackHours: 24,
+  includeError: true,
+  includeDisposed: true,
+  maxObservations: 30,
+  maxChildObservations: 20,
+}
 
 /** 一段「interrupted 结尾」的事件，时间 2 小时前。 */
 function interruptedEvents(): SessionEventLike[] {
@@ -201,5 +208,93 @@ describe('scanSessions：失败隔离与资源', () => {
     const rows = await scanSessions(hosts, OPTS, NO_MTIME)
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ action: 'skip', cause: expect.stringMatching(/^error:/) })
+  })
+})
+
+
+describe('scanSessions：主会话在等子会话', () => {
+  /** 父会话：一轮正常结束（模型结束轮次去等子代理）+ 子代理目录事实。 */
+  function parentEvents(childId: string, mode = 'continuable'): SessionEventLike[] {
+    return [
+      { type: 'turn/start', time: NOW - 3 * HOUR },
+      { type: 'turn/end', time: NOW - 3 * HOUR, data: { turn: 1, reason: { kind: 'completed' } } },
+      {
+        type: 'subagent/catalog',
+        time: NOW - 2 * HOUR,
+        data: { version: 0, childId, childCreatedAt: NOW - 2 * HOUR, mode, label: '子任务' },
+      },
+    ]
+  }
+
+  /** 子会话：轮次异常收尾。 */
+  function childInterrupted(): SessionEventLike[] {
+    return [
+      { type: 'turn/start', time: NOW - 2 * HOUR },
+      { type: 'turn/end', time: NOW - 2 * HOUR, data: { turn: 1, reason: { kind: 'interrupted' } } },
+    ]
+  }
+
+  /** 子会话：正常完成。 */
+  function childCompleted(): SessionEventLike[] {
+    return [
+      { type: 'turn/start', time: NOW - 2 * HOUR },
+      { type: 'turn/end', time: NOW - 2 * HOUR, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+  }
+
+  it('父会话正常结束 + 子会话被中断 → 父会话 continue（cause awaiting-child），并带上子会话', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('parent'),
+      observeSession: async (id: string) =>
+        id === 'child-1' ? { events: childInterrupted() } : { events: parentEvents('child-1') },
+    })
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
+    expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({
+      action: 'continue',
+      cause: 'awaiting-child',
+      children: [{ childId: 'child-1', cause: 'interrupted' }],
+    })
+  })
+
+  it('父会话正常结束 + 子会话已完成 → 照旧 skip normal-end', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('parent'),
+      observeSession: async (id: string) =>
+        id === 'child-1' ? { events: childCompleted() } : { events: parentEvents('child-1') },
+    })
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
+    expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({ action: 'skip', cause: 'normal-end' })
+  })
+
+  it('子会话读取预算用尽 → 不再读子会话（父会话按正常结束跳过）', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('parent'),
+      observeSession: async (id: string) =>
+        id === 'child-1' ? { events: childInterrupted() } : { events: parentEvents('child-1') },
+    })
+    const rows = await scanSessions(hosts, { ...OPTS, maxChildObservations: 0 }, RECENT_MTIME)
+    expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({ action: 'skip', cause: 'normal-end' })
+  })
+
+  it('外部后端的子会话（mode=external）不读不续', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('parent'),
+      observeSession: async (id: string) =>
+        id === 'child-1' ? { events: childInterrupted() } : { events: parentEvents('child-1', 'external') },
+    })
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
+    expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({ action: 'skip', cause: 'normal-end' })
+  })
+
+  it('子会话读不出来 → 不影响父会话的判定', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('parent'),
+      observeSession: async (id: string) => {
+        if (id === 'child-1') throw new Error('corrupt child log')
+        return { events: parentEvents('child-1') }
+      },
+    })
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
+    expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({ action: 'skip', cause: 'normal-end' })
   })
 })
