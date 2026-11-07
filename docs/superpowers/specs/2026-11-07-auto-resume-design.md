@@ -39,27 +39,53 @@
    （源码 `initializeAgent`/`runMaintenance` 核实）。用户停止保留收件箱
    （`keepInbox: true`）。
 6. **枚举与继续的入口**：`ctx.sessionQuery.listSessions()`（全部持久 + 在册会话）、
-   `ctx.sessionQuery.observeSession(id)`（整段事件，含合成的 `interrupted` 收尾）、
-   `ctx.sessionPersistence.stat(id)`（日志路径 → mtime 预筛）、
-   `ctx.agents.get(id)`（在册/运行中）、`ctx.workspaceRegistry.archivedSessionIds`
-   （已归档）、`ctx.sessionController.prompt({ requestId, sessionId, mode, content })`
+   `ctx.sessionQuery.observeSession(id)`（整段事件，含合成的 `interrupted` 收尾；
+   租约同时带回会话头 `header`）、`ctx.agents.get(id)`（在册/运行中）、
+   `ctx.workspaceRegistry.archivedSessionIds`（已归档）、
+   `ctx.sessionController.prompt({ requestId, sessionId, mode, content })`
    （与界面发送同一条路，会话自动 resume 后投递）。
+
+   > **2026-11-07 现场修正（核对 dsh 0.2.2-rc.1 源码 + 本机实测）**：候选枚举
+   > **不再**用 `ctx.sessionPersistence.stat(id)` 逐会话拿日志路径。该调用在
+   > JSONL 后端里要遍历全部项目目录定位日志（实测 ~20ms/会话），遇到 v3 等历史
+   > 格式会话还要每次重算一遍**全语料 revision**（本机 1329 个历史会话）——对
+   > 全量会话逐个调用，一次启动扫描要十几分钟起步；预筛一旦缺席还会退化成
+   > 对 9000+ 个会话逐个 `observeSession`（整读 + 回放校验 1.4GB 日志），把宿主
+   > 内存读到 1.2GB。改为 fs 直查最近候选（见下）。
+
+## 候选枚举（2026-11-07 现场修正）
+
+会话库布局（`$DSH_HOME/sessions`，缺省 `~/.dsh/sessions`）：
+`<项目目录>/<会话 id>/session.<版本>.jsonl[.zstd]`；会话目录名即会话 id。
+
+枚举走 fs 直查（`src/recent.ts`）：两轮 readdir（项目目录 → 会话目录）加每个
+会话一次直路径 `stat`，按日志 mtime 取窗口内最近活动过的会话，取版本号最高的
+那一代日志；mtime 降序后最多取 `maxObservations`（默认 30）个进整读。
+
+配套护栏：
+
+- 观察单个会话有 15s 硬超时，坏日志 / 卡住的会话不拖死整场扫描；
+- mtime 拿不到的会话 fail closed 跳过（旧会话不读，也不漏判）；
+- 子代理会话在**观察之后**按租约带回的会话头判定（`origin` / `parentSession`），
+  跳过不投递——fs 通道枚举不到会话元数据，投过去宿主会回
+  「owned by subagent routing」。
 
 ## 判定规则
 
 输入：一个会话的完整事件序列（`observeSession` 返回，尾部开轮次已被宿主补成
 `interrupted`）、配置、当前时间。输出：继续（带原因）或跳过（带原因）。
 
-扫描流程（scan.ts）：`listSessions()` 拿全量 → 逐个按第 3、4、5 条过滤 →
-`stat(id)` 取日志路径读 mtime，mtime 早于时间窗的直接跳过（免整读旧日志）→
-余者 `observeSession(id)` 读事件进判定器 → 收集候选，按 `staggerMs` 逐个投递。
+扫描流程（scan.ts）：fs 直查拿最近候选 → 按第 3、4、5 条过滤（子代理、归档、
+运行中）→ 逐个 `observeSession(id)` 读事件进判定器（带 15s 超时）→ 收集候选，
+按 `staggerMs` 逐个投递。
 
 按顺序：
 
 1. 无任何事件 → 跳过（空白会话）。
 2. 最后事件时间早于时间窗（`now - lookbackHours`）→ 跳过（窗外）。
 3. `header.origin === 'subagent'` 或 `header.parentSession` 存在 → 跳过（子代理会话，
-   归父会话路由管）。此条在扫描层过滤，不在判定器内。
+   归父会话路由管）。此条在扫描层过滤，不在判定器内——fs 直查通道枚举不到
+   会话元数据，改在观察之后按租约带回的会话头判定（效果相同，少一次投递）。
 4. 已归档（`archivedSessionIds` 命中）→ 跳过。同上，扫描层过滤。
 5. 会话正在运行（`agents.get(id)` 的 agent `status === 'running'`）→ 跳过。
    在册但空闲（attached-idle，用户开着会话没在跑）→ 仍继续——这正是本插件要替
@@ -128,6 +154,7 @@
 | `staggerMs` | `2000` | 相邻两次投递的间隔。 |
 | `includeError` | `true` | 是否继续 `error` 结尾的会话。 |
 | `includeDisposed` | `true` | 是否继续 `aborted`/`disposed` 结尾的会话。 |
+| `maxObservations` | `30` | 一次启动最多整读多少个最近候选（成本护栏）。 |
 | `messageTemplate` | 见上 | 继续消息模板，含 `{reason}`/`{time}`。 |
 
 `interrupted` 与排队形态不受开关保护（它们就是本插件的存在理由）；`includeError` /

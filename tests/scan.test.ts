@@ -129,6 +129,42 @@ describe('scanSessions：mtime 预筛', () => {
   })
 })
 
+describe('scanSessions：fs 直查通道', () => {
+  /** fs 通道：只给 sessionId，没有 header（枚举层拿不到会话元数据）。 */
+  const recent = {
+    async listRecent() {
+      return [
+        { sessionId: 'child-origin', mtime: NOW - HOUR },
+        { sessionId: 'child-parent', mtime: NOW - HOUR },
+        { sessionId: 'top', mtime: NOW - HOUR },
+      ]
+    },
+  }
+
+  it('观察到的 header 标明子代理/子会话 → skip subagent（不投递）', async () => {
+    const hosts = makeHosts({
+      observeSession: async (id: string) => ({
+        events: interruptedEvents(),
+        ...(id === 'child-origin'
+          ? { header: { origin: 'subagent' } }
+          : id === 'child-parent'
+            ? { header: { parentSession: 'p1' } }
+            : {}),
+      }),
+    })
+    const rows = await scanSessions(hosts, OPTS, NO_MTIME, undefined, recent)
+    expect(rows.find((row) => row.sessionId === 'child-origin')).toMatchObject({ action: 'skip', cause: 'subagent' })
+    expect(rows.find((row) => row.sessionId === 'child-parent')).toMatchObject({ action: 'skip', cause: 'subagent' })
+    expect(rows.find((row) => row.sessionId === 'top')).toMatchObject({ action: 'continue', cause: 'interrupted' })
+  })
+
+  it('header 缺席时照常判定（不因缺元数据漏掉会话）', async () => {
+    const hosts = makeHosts({ observeSession: async () => ({ events: interruptedEvents() }) })
+    const rows = await scanSessions(hosts, OPTS, NO_MTIME, undefined, recent)
+    expect(rows.filter((row) => row.action === 'continue')).toHaveLength(3)
+  })
+})
+
 describe('scanSessions：失败隔离与资源', () => {
   it('单会话观察抛错 → 该行 skip cause 以 error: 开头，其余照常判定', async () => {
     const hosts = makeHosts({

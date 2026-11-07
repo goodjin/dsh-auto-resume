@@ -10,6 +10,7 @@
  */
 
 import { classifySession, type ClassifyOptions, type SessionEventLike, type Verdict } from './classify.ts'
+import type { RecentCandidate } from './recent.ts'
 
 /** 扫描需要的最小宿主服务面（测试立桩照这个来）。 */
 export interface ScanHosts {
@@ -34,7 +35,15 @@ export interface SessionRecordLike {
 }
 
 /** observeSession 返回的最小观察面；可释放时由扫描负责释放。 */
-export type SessionObservationLike = { events: SessionEventLike[] } & {
+export type SessionObservationLike = {
+  events: SessionEventLike[]
+  /**
+   * 观察租约带回来的会话头。fs 直查通道枚举不到元数据，只有头这一处能认出
+   * 子代理会话（`origin` / `parentSession`）——认不出就会白投一次、
+   * 宿主回「owned by subagent routing」。
+   */
+  header?: { origin?: string; parentSession?: string }
+} & {
   [Symbol.dispose]?: () => void
 }
 
@@ -191,11 +200,8 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** fs 直查通道给出的候选：会话 id + 日志 mtime。 */
-export interface RecentCandidate {
-  sessionId: string
-  mtime: number
-}
+/** fs 直查通道给出的候选：会话 id + 日志 mtime（实现在 recent.ts）。 */
+export type { RecentCandidate }
 
 /**
  * 最近候选枚举通道：按 mtime 降序返回窗口内最近的至多 `maxObservations` 个。
@@ -222,6 +228,12 @@ function ledgerRowOfId(sessionId: string, verdict: Verdict): ScanLedgerRow {
   }
 }
 
+/** 会话头是否表明它是子代理会话（子会话归父会话路由管，不单独继续）。 */
+function isSubagentHeader(header: { origin?: string; parentSession?: string } | undefined): boolean {
+  if (header === undefined) return false
+  return header.origin === 'subagent' || header.parentSession !== undefined
+}
+
 /** 带硬超时的观察：超时折成 error 账目行，不拖死整场扫描。 */
 async function observeRowTimed(
   hosts: ScanHosts,
@@ -237,6 +249,11 @@ async function observeRowTimed(
       }),
     ])
     try {
+      // 子代理会话归父会话路由管：观察租约带头，头里认得出就当场跳过，
+      // 免得投一次被宿主回「owned by subagent routing」。
+      if (isSubagentHeader(observation.header)) {
+        return { sessionId, action: 'skip', cause: 'subagent', lastTime: 0 }
+      }
       return ledgerRowOfId(sessionId, classifySession(observation.events, options))
     } finally {
       observation[Symbol.dispose]?.()
