@@ -29,7 +29,19 @@ export type Verdict =
   | { action: 'continue'; cause: ContinueCause; detail?: string; lastTime: number }
   | {
       action: 'skip'
-      cause: 'blank' | 'outside-window' | 'user-stopped' | 'normal-end' | 'cancel-by-parent-or-hook'
+      /**
+       * 跳过原因。`disposed-excluded` / `error-excluded` 表示「本来该续，但被
+       * 对应开关关掉了」——与 `normal-end`（本来就正常结束）分开，账目里一眼
+       * 看得出是配置挡住的。
+       */
+      cause:
+        | 'blank'
+        | 'outside-window'
+        | 'user-stopped'
+        | 'normal-end'
+        | 'cancel-by-parent-or-hook'
+        | 'disposed-excluded'
+        | 'error-excluded'
       lastTime: number
     }
 
@@ -121,13 +133,13 @@ export function classifySession(events: readonly SessionEventLike[], options: Cl
       if (cancel === 'disposed') {
         return options.includeDisposed
           ? { action: 'continue', cause: 'disposed', lastTime }
-          : { action: 'skip', cause: 'normal-end', lastTime }
+          : { action: 'skip', cause: 'disposed-excluded', lastTime }
       }
       // parent / hook / legacy：父会话或钩子的主动行为，不算异常。
       return { action: 'skip', cause: 'cancel-by-parent-or-hook', lastTime }
     }
     case 'error': {
-      if (!options.includeError) return { action: 'skip', cause: 'normal-end', lastTime }
+      if (!options.includeError) return { action: 'skip', cause: 'error-excluded', lastTime }
       const detail = errorDetail(reason?.error)
       return {
         action: 'continue',

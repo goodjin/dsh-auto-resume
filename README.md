@@ -35,8 +35,16 @@
 | `startupDelayMs` | `8000` | 启动后延迟多久开始扫描。 |
 | `staggerMs` | `2000` | 相邻两次投递的间隔。 |
 | `includeError` | `true` | 是否继续 `error` 结尾的会话。 |
-| `includeDisposed` | `true` | 是否继续桌面版退出中断的会话。 |
+| `includeDisposed` | `true` | 是否继续桌面版退出中断的会话（`aborted`/`disposed`）。 |
 | `messageTemplate` | 见源码 `config.ts` | 继续消息模板，含 `{reason}`/`{time}` 占位符。 |
+
+两个 `include*` 开关只管「本来该续、被开关挡下」的两类：
+
+- **人工停止（`aborted`/`user`）不受任何开关影响**——手动停一次就是永久豁免，
+  永远不会自动继续；
+- `includeDisposed=false` 时，「桌面版退出时被中断」的会话不续，账目里的跳过
+  原因写 `disposed-excluded`（`includeError=false` 同理写 `error-excluded`），
+  一眼能看出是开关挡的，而不是「本来就正常结束」。
 
 设计依据与判定规则全文见
 [docs/superpowers/specs/2026-11-07-auto-resume-design.md](docs/superpowers/specs/2026-11-07-auto-resume-design.md)。

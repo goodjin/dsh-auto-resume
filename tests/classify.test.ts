@@ -68,10 +68,10 @@ describe('classifySession：按最后一轮的结束原因', () => {
     expect(verdict).toMatchObject({ action: 'continue', cause: 'error', detail: 'fetch failed' })
   })
 
-  it('error 且 includeError=false → skip', () => {
+  it('error 且 includeError=false → skip error-excluded（账目里看得出是开关挡的）', () => {
     const events = [turnEnd({ kind: 'error', error: { message: 'x' } }, 2)]
     const verdict = classifySession(events, { ...OPTS, includeError: false })
-    expect(verdict).toMatchObject({ action: 'skip' })
+    expect(verdict).toMatchObject({ action: 'skip', cause: 'error-excluded' })
   })
 
   it('aborted/disposed 且 includeDisposed → continue disposed', () => {
@@ -79,10 +79,10 @@ describe('classifySession：按最后一轮的结束原因', () => {
     expect(classifySession(events, OPTS)).toMatchObject({ action: 'continue', cause: 'disposed' })
   })
 
-  it('aborted/disposed 且 includeDisposed=false → skip', () => {
+  it('aborted/disposed 且 includeDisposed=false → skip disposed-excluded（账目里看得出是开关挡的）', () => {
     const events = [turnEnd({ kind: 'aborted', reason: { kind: 'disposed' } }, 2)]
     const verdict = classifySession(events, { ...OPTS, includeDisposed: false })
-    expect(verdict).toMatchObject({ action: 'skip' })
+    expect(verdict).toMatchObject({ action: 'skip', cause: 'disposed-excluded' })
   })
 
   it('用户停止（aborted/user）即使尾部有排队消息 → skip user-stopped', () => {
