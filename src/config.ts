@@ -18,6 +18,7 @@ export interface AutoResumeConfig {
   staggerMs?: number
   includeError?: boolean
   includeDisposed?: boolean
+  maxObservations?: number
   messageTemplate?: string
 }
 
@@ -29,6 +30,7 @@ export interface ResolvedConfig {
   staggerMs: number
   includeError: boolean
   includeDisposed: boolean
+  maxObservations: number
   messageTemplate: string
 }
 
@@ -46,6 +48,7 @@ export const Config: Schema<AutoResumeConfig> = Schema.object({
   staggerMs: Schema.number().default(2000),
   includeError: Schema.boolean().default(true),
   includeDisposed: Schema.boolean().default(true),
+  maxObservations: Schema.number().default(30),
   messageTemplate: Schema.string().default(DEFAULT_MESSAGE_TEMPLATE),
 })
 
@@ -73,6 +76,7 @@ export function resolveConfig(raw: unknown): ResolvedConfig {
     staggerMs: nonNegative(source.staggerMs, 2000),
     includeError: booleanOr(source.includeError, true),
     includeDisposed: booleanOr(source.includeDisposed, true),
+    maxObservations: nonNegative(source.maxObservations, 30),
     messageTemplate:
       typeof source.messageTemplate === 'string' && source.messageTemplate.trim() !== ''
         ? source.messageTemplate

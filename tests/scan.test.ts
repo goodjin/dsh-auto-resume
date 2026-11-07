@@ -4,7 +4,7 @@ import type { SessionEventLike } from '../src/classify.ts'
 
 const NOW = new Date('2026-11-07T02:00:00').getTime()
 const HOUR = 3_600_000
-const OPTS = { now: NOW, lookbackHours: 24, includeError: true, includeDisposed: true }
+const OPTS = { now: NOW, lookbackHours: 24, includeError: true, includeDisposed: true, maxObservations: 30 }
 
 /** 一段「interrupted 结尾」的事件，时间 2 小时前。 */
 function interruptedEvents(): SessionEventLike[] {
@@ -37,12 +37,17 @@ function makeHosts(overrides: {
     },
     agents: overrides.agents ?? { get: () => undefined },
     workspaceRegistry: overrides.workspaceRegistry ?? { archivedSessionIds: [] },
-    ...(overrides.sessionPersistence === undefined ? {} : { sessionPersistence: overrides.sessionPersistence }),
+    // 默认给每会话一个日志路径，让注入的 statMtime 通道说话；显式覆写优先。
+    ...(overrides.sessionPersistence === undefined
+      ? { sessionPersistence: { stat: async (id: string) => ({ location: { path: `/logs/${id}.jsonl.zstd` } }) } }
+      : { sessionPersistence: overrides.sessionPersistence }),
   }
   return { ...hosts, observed }
 }
 
-/** 默认 mtime 通道：一律回 undefined（不预筛）。 */
+/** 默认 mtime 通道：一律回 2 小时前（窗口内，可整读）。 */
+const RECENT_MTIME = { statMtime: async () => NOW - 2 * HOUR }
+/** mtime 不可知通道：stat/statMtime 都拿不到时间。 */
 const NO_MTIME = { statMtime: async () => undefined }
 
 function listing(...ids: string[]): ScanHosts['sessionQuery']['listSessions'] {
@@ -58,7 +63,7 @@ describe('scanSessions：扫描层过滤', () => {
         { header: { id: 'normal' } },
       ],
     })
-    const rows = await scanSessions(hosts, OPTS, NO_MTIME)
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
     expect(hosts.observed).toEqual(['normal'])
     expect(rows.find((row) => row.sessionId === 'child-origin')).toMatchObject({ action: 'skip', cause: 'subagent' })
     expect(rows.find((row) => row.sessionId === 'child-parent')).toMatchObject({ action: 'skip', cause: 'subagent' })
@@ -70,7 +75,7 @@ describe('scanSessions：扫描层过滤', () => {
       listSessions: listing('arch-1', 'normal'),
       workspaceRegistry: { archivedSessionIds: ['arch-1'] },
     })
-    const rows = await scanSessions(hosts, OPTS, NO_MTIME)
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
     expect(hosts.observed).toEqual(['normal'])
     expect(rows.find((row) => row.sessionId === 'arch-1')).toMatchObject({ action: 'skip', cause: 'archived' })
   })
@@ -84,7 +89,7 @@ describe('scanSessions：扫描层过滤', () => {
         },
       },
     })
-    const rows = await scanSessions(hosts, OPTS, NO_MTIME)
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
     expect(rows.find((row) => row.sessionId === 'busy')).toMatchObject({ action: 'skip', cause: 'running' })
     expect(rows.find((row) => row.sessionId === 'idle')).toMatchObject({ action: 'continue' })
   })
@@ -102,11 +107,25 @@ describe('scanSessions：mtime 预筛', () => {
     expect(rows).toEqual([expect.objectContaining({ sessionId: 'old', action: 'skip', cause: 'outside-window' })])
   })
 
-  it('stat 缺席或没有 path → 照常观察判定', async () => {
+  it('stat 缺席或拿不到时间 → skip（fail closed），不读事件', async () => {
     const hosts = makeHosts({ listSessions: listing('no-stat') })
     const rows = await scanSessions(hosts, OPTS, NO_MTIME)
-    expect(hosts.observed).toEqual(['no-stat'])
-    expect(rows.find((row) => row.sessionId === 'no-stat')).toMatchObject({ action: 'continue' })
+    expect(hosts.observed).toEqual([])
+    expect(rows).toEqual([expect.objectContaining({ sessionId: 'no-stat', action: 'skip', cause: 'mtime-unknown' })])
+  })
+
+  it('maxObservations 截断：只整读最近 N 个，按 mtime 降序', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('mid', 'newest', 'oldest'),
+      sessionPersistence: { stat: async (id: string) => ({ location: { path: `/logs/${id}.jsonl.zstd` } }) },
+    })
+    const io = { statMtime: async (path: string) => {
+      const table: Record<string, number> = { mid: NOW - 5 * HOUR, newest: NOW - 1 * HOUR, oldest: NOW - 20 * HOUR }
+      return table[path.split('/').pop()!.replace('.jsonl.zstd', '')]
+    } }
+    const rows = await scanSessions(hosts, { ...OPTS, maxObservations: 2 }, io)
+    expect(hosts.observed).toEqual(['newest', 'mid'])
+    expect(rows.filter((row) => row.sessionId === 'oldest')).toHaveLength(0)
   })
 })
 
@@ -119,7 +138,7 @@ describe('scanSessions：失败隔离与资源', () => {
         return { events: interruptedEvents() }
       },
     })
-    const rows = await scanSessions(hosts, OPTS, NO_MTIME)
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
     expect(rows.find((row) => row.sessionId === 'bad')).toMatchObject({
       action: 'skip',
       cause: expect.stringMatching(/^error:/),
@@ -133,7 +152,7 @@ describe('scanSessions：失败隔离与资源', () => {
       listSessions: listing('d'),
       observeSession: async () => ({ events: interruptedEvents(), [Symbol.dispose]: dispose }),
     })
-    await scanSessions(hosts, OPTS, NO_MTIME)
+    await scanSessions(hosts, OPTS, RECENT_MTIME)
     expect(dispose).toHaveBeenCalledTimes(1)
   })
 

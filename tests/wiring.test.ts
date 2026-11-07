@@ -49,6 +49,9 @@ function makeCtx(services: Record<string, unknown>) {
   const injectCalls: string[][] = []
   const ctx = {
     ...services,
+    get(serviceName: string) {
+      return services[serviceName]
+    },
     effect(factory: () => unknown, _label?: string) {
       const disposer = factory()
       if (typeof disposer === 'function') disposers.push(disposer as () => void)
@@ -71,6 +74,8 @@ describe('apply 行为', async () => {
 
   function fakeServices() {
     const prompts: Array<{ sessionId: string }> = []
+    // statMtime 走真实 fs.stat：给一个真实存在、mtime 新鲜的文件路径。
+    const realPath = fileURLToPath(import.meta.url)
     return {
       prompts,
       services: {
@@ -97,6 +102,16 @@ describe('apply 行为', async () => {
         },
         agents: { get: () => undefined },
         workspaceRegistry: { archivedSessionIds: [] },
+        sessionRecent: {
+          async listRecent(_lookbackHours: number, _maxObservations: number, _now: number) {
+            return [{ sessionId: 'need-resume', mtime: NOW - 3_600_000 }]
+          },
+        },
+        sessionPersistence: {
+          async stat(_id: string) {
+            return { location: { path: realPath } }
+          },
+        },
         sessionController: {
           prompt: async (request: { sessionId: string }, _signal?: AbortSignal) => {
             prompts.push(request)
@@ -139,31 +154,32 @@ describe('apply 行为', async () => {
     expect(() => disposers[0]?.()).not.toThrow()
   })
 
-  it('可选服务 sessionPersistence 未注入（读属性即抛）→ 走 ctx.get，扫描照常', async () => {
-    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+  it('sessionRecent 通道调用时抛错 → 整场折进 error 日志，不投递不外抛', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const { prompts, services } = fakeServices()
-    // cordis 语义：未注入的属性读一次抛一次；get 回 undefined。
-    const ctx = {
+    const all: Record<string, unknown> = {
       ...services,
+      sessionRecent: {
+        async listRecent() {
+          throw new Error('enumeration offline')
+        },
+      },
+    }
+    const ctx = {
+      ...all,
+      get(serviceName: string) {
+        return all[serviceName]
+      },
       effect(factory: () => unknown) {
         return factory()
       },
       inject() {},
-      get(serviceName: string) {
-        if (serviceName === 'sessionPersistence') return undefined
-        throw new Error(`cannot get property "${serviceName}" without inject`)
-      },
     }
-    Object.defineProperty(ctx, 'sessionPersistence', {
-      get() {
-        throw new Error('cannot get property "sessionPersistence" without inject')
-      },
-    })
     apply(ctx, { startupDelayMs: 0, staggerMs: 0 })
     await new Promise((resolve) => setTimeout(resolve, 30))
-    expect(prompts.map((call) => call.sessionId)).toEqual(['need-resume'])
-    const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
-    expect(logged).not.toContain('error:')
-    infoSpy.mockRestore()
+    expect(prompts).toEqual([])
+    const logged = errorSpy.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(logged).toContain('enumeration offline')
+    errorSpy.mockRestore()
   })
 })

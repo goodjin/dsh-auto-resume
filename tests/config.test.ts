@@ -10,6 +10,7 @@ describe('resolveConfig：缺省补默认、负数取 0', () => {
       staggerMs: 2000,
       includeError: true,
       includeDisposed: true,
+      maxObservations: 30,
       messageTemplate: DEFAULT_MESSAGE_TEMPLATE,
     })
   })

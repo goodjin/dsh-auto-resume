@@ -12,11 +12,14 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { stat } from 'node:fs/promises'
+import { readdir, stat } from 'node:fs/promises'
+import type { Dirent } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 import { resolveConfig, type ResolvedConfig } from './config.ts'
 import type { ContinueCause } from './classify.ts'
-import { scanSessions, type ScanHosts, type ScanLedgerRow } from './scan.ts'
+import { scanSessions, type RecentCandidate, type RecentEnumeration, type ScanHosts, type ScanLedgerRow } from './scan.ts'
 import { deliverContinuations, type DeliveryResult, type DeliverIo, type PromptHost } from './deliver.ts'
 import { registerHealthRoute, type HealthRouteContext } from './route.ts'
 
@@ -40,6 +43,10 @@ export interface ScanSnapshot {
   enabled: boolean
   startedAt: number | null
   finishedAt: number | null
+  /** 头部过滤已处理的会话数（实时递增，观察扫描卡段的探针）。 */
+  scanned: number
+  /** 需要枚举的会话总数（listSessions 返回后填上）。 */
+  total: number
   config: ResolvedConfig
   rows: ScanLedgerRow[]
   deliveries: DeliveryResult[]
@@ -53,7 +60,7 @@ let latestSnapshot: ScanSnapshot | null = null
  */
 export function apply(ctx: PluginContext, rawConfig: unknown): void {
   const config = resolveConfig(rawConfig)
-  latestSnapshot = { enabled: config.enabled, startedAt: null, finishedAt: null, config, rows: [], deliveries: [] }
+  latestSnapshot = { enabled: config.enabled, startedAt: null, finishedAt: null, scanned: 0, total: 0, config, rows: [], deliveries: [] }
 
   ctx.inject?.(['webServer'], (child) => {
     registerHealthRoute(child as HealthRouteContext, () => latestSnapshot)
@@ -86,8 +93,14 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
       lookbackHours: config.lookbackHours,
       includeError: config.includeError,
       includeDisposed: config.includeDisposed,
+      maxObservations: config.maxObservations,
     },
     { statMtime: statMtimeMs },
+    (scanned, total) => {
+      snapshot.scanned = scanned
+      snapshot.total = total
+    },
+    recentChannelOf(ctx),
   )
   const targets = rows
     .filter((row) => row.action === 'continue')
@@ -122,6 +135,58 @@ async function statMtimeMs(path: string): Promise<number | undefined> {
   } catch {
     return undefined
   }
+}
+
+/** 会话库根目录：$DSH_HOME/sessions，缺省 ~/.dsh/sessions。 */
+function sessionsRoot(): string {
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(home, 'sessions')
+}
+
+/**
+ * fs 直查最近候选：两轮 readdir + 每会话一次直路径 stat，不经过宿主
+ * 逐会话服务（`sessionPersistence.stat` 有挂死先例，2026-11-07 现场）。
+ * 会话目录名即会话 id（带或不带 `session-` 前缀，宿主按名解析）。
+ */
+async function listRecentFs(lookbackHours: number, maxObservations: number, now: number): Promise<RecentCandidate[]> {
+  const root = sessionsRoot()
+  const windowStart = now - lookbackHours * 3_600_000
+  const out: RecentCandidate[] = []
+  let workspaces: Dirent[]
+  try {
+    workspaces = await readdir(root, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  for (const workspace of workspaces) {
+    if (!workspace.isDirectory()) continue
+    const workspacePath = join(root, workspace.name)
+    let sessionDirs: Dirent[]
+    try {
+      sessionDirs = await readdir(workspacePath, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const sessionDir of sessionDirs) {
+      if (!sessionDir.isDirectory()) continue
+      let mtime: number
+      try {
+        mtime = (await stat(join(workspacePath, sessionDir.name, 'session.v4.jsonl.zstd'))).mtimeMs
+      } catch {
+        continue
+      }
+      if (mtime < windowStart) continue
+      out.push({ sessionId: sessionDir.name, mtime })
+    }
+  }
+  out.sort((a, b) => b.mtime - a.mtime)
+  return out.slice(0, Math.max(maxObservations, 0))
+}
+
+/** 最近候选通道：宿主提供 `sessionRecent` 时用它，否则退回本机 fs 直查。 */
+function recentChannelOf(ctx: PluginContext): RecentEnumeration {
+  const hostProvided = optionalService(ctx, 'sessionRecent') as RecentEnumeration | undefined
+  return hostProvided ?? { listRecent: listRecentFs }
 }
 
 /**
