@@ -10,7 +10,7 @@
  */
 
 import { classifySession, type ClassifyOptions, type SessionEventLike, type Verdict } from './classify.ts'
-import { catalogChildren, childNeedsResume, hasLocalSession, type PendingChild } from './children.ts'
+import { catalogChildren, childNeedsResume, hasLocalSession, reportedChildIds, type PendingChild } from './children.ts'
 import type { RecentCandidate } from './recent.ts'
 
 /** 扫描需要的最小宿主服务面（测试立桩照这个来）。 */
@@ -328,11 +328,19 @@ async function pendingChildren(
 ): Promise<{ pending: PendingChild[]; notes: Array<{ childId: string; detail: string }> }> {
   const pending: PendingChild[] = []
   const notes: Array<{ childId: string; detail: string }> = []
+  // 已经向主会话报告过的子会话（结算通知在案）不算「还在等」——主会话知道结果了，
+  // 把它叫醒是多余的（2026-11-09 现场：正常结束的会话被子会话的错误通知
+  // 拖去重跑）。
+  const reported = reportedChildIds(parentEvents)
   // 目录按创建顺序追加，**新的在后面**：被中断的通常是最新的那个，所以倒着看，
   // 观察预算有限时先看它。
   const children = [...catalogChildren(parentEvents)].reverse()
   for (const child of children) {
     if (budget.left <= 0) break
+    if (reported.has(child.childId)) {
+      notes.push({ childId: child.childId, detail: '已经向主会话报告过（结算通知在案）' })
+      continue
+    }
     if (!hasLocalSession(child)) {
       notes.push({ childId: child.childId, detail: '外部后端子会话，没有本地会话日志' })
       continue

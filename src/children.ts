@@ -80,3 +80,33 @@ export function childNeedsResume(
 export function hasLocalSession(child: CatalogChild): boolean {
   return child.mode !== 'external'
 }
+
+/**
+ * 主会话已经收到过结算通知的子会话（它们已经向主会话报告过结果了）。
+ *
+ * 结算通知是宿主往主会话追加的一条用户消息：来源标记 `subagent-settled`，
+ * 带子会话 id（`senderSessionId`）与人话摘要（「Background subagent <id> …」）。
+ *
+ * 这一条是「主会话是不是还在等」的权威判据：子会话报过了，主会话就知道结果了
+ * （哪怕通知还躺在收件箱里没被领取），这时把主会话叫醒是多余的。
+ */
+export function reportedChildIds(events: readonly SessionEventLike[]): Set<string> {
+  const ids = new Set<string>()
+  for (const event of events) {
+    if (event.type !== 'user/message' && event.type !== 'agent/inbox/spliced') continue
+    const source = event.data?.source
+    if (typeof source !== 'object' || source === null) continue
+    const record = source as Record<string, unknown>
+    if (record.kind !== 'subagent-settled') continue
+    const sender = record.senderSessionId
+    if (typeof sender === 'string' && sender !== '') {
+      ids.add(sender)
+      continue
+    }
+    // 没有 senderSessionId 时从摘要里点名解析（人话里带子会话 id）。
+    const summary = typeof record.summary === 'string' ? record.summary : ''
+    const match = /Background subagent ([0-9a-zA-Z-]{2,})/.exec(summary)
+    if (match?.[1] !== undefined) ids.add(match[1])
+  }
+  return ids
+}

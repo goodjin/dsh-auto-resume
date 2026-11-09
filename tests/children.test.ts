@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { catalogChildren, childNeedsResume, hasLocalSession } from '../src/children.ts'
+import { catalogChildren, childNeedsResume, hasLocalSession, reportedChildIds } from '../src/children.ts'
 import type { SessionEventLike } from '../src/classify.ts'
 
 const NOW = new Date('2026-11-07T02:00:00').getTime()
@@ -81,5 +81,52 @@ describe('hasLocalSession：外部后端的子会话没有本地会话', () => {
     expect(hasLocalSession({ childId: 'c', mode: 'continuable' })).toBe(true)
     expect(hasLocalSession({ childId: 'c', mode: 'unknown' })).toBe(true)
     expect(hasLocalSession({ childId: 'c' })).toBe(true)
+  })
+})
+
+
+describe('reportedChildIds：主会话已经收到过结算通知的子会话', () => {
+  it('从结算通知里取出子会话 id', () => {
+    const events: SessionEventLike[] = [
+      {
+        type: 'user/message',
+        time: NOW,
+        data: {
+          source: {
+            kind: 'subagent-settled',
+            form: 'notice',
+            summary: 'Background subagent c1 failed before it finished.',
+            senderSessionId: 'c1',
+          },
+        },
+      },
+    ]
+    expect([...reportedChildIds(events)]).toEqual(['c1'])
+  })
+
+  it('没有 senderSessionId 时从摘要里点名解析', () => {
+    const events: SessionEventLike[] = [
+      {
+        type: 'user/message',
+        time: NOW,
+        data: { source: { kind: 'subagent-settled', summary: 'Background subagent c2 finished.' } },
+      },
+    ]
+    expect([...reportedChildIds(events)]).toEqual(['c2'])
+  })
+
+  it('收件箱里还没被领取的通知也算「已报告」', () => {
+    const events: SessionEventLike[] = [
+      {
+        type: 'agent/inbox/spliced',
+        time: NOW,
+        data: { source: { kind: 'subagent-settled', senderSessionId: 'c3' } },
+      },
+    ]
+    expect([...reportedChildIds(events)]).toEqual(['c3'])
+  })
+
+  it('普通消息不算', () => {
+    expect(reportedChildIds([{ type: 'user/message', time: NOW, data: { source: { kind: 'user' } } }]).size).toBe(0)
   })
 })

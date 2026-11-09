@@ -326,3 +326,52 @@ describe('scanSessions：子会话观察顺序', () => {
     expect(observed.filter((id) => id !== 'parent')).toEqual(['new-child'])
   })
 })
+
+
+describe('scanSessions：子会话已经报告过的不算「还在等」', () => {
+  /** 父会话：一轮正常结束 + 子代理目录事实 + 子会话的结算通知。 */
+  function parentWithSettledChild(childId: string): SessionEventLike[] {
+    return [
+      { type: 'turn/start', time: NOW - 3 * HOUR },
+      {
+        type: 'subagent/catalog',
+        time: NOW - 2 * HOUR,
+        data: { version: 0, childId, childCreatedAt: NOW - 2 * HOUR, mode: 'continuable', label: '子任务' },
+      },
+      {
+        // 结算通知落在最后一轮**之前**：真实日志里它是被那一轮领取的
+        type: 'user/message',
+        time: NOW - 2 * HOUR,
+        data: {
+          source: {
+            kind: 'subagent-settled',
+            form: 'notice',
+            summary: `Background subagent ${childId} failed before it finished.`,
+            senderSessionId: childId,
+          },
+        },
+      },
+      { type: 'turn/end', time: NOW - 3 * HOUR, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+  }
+
+  it('子会话已报告（哪怕是失败）→ 主会话照旧 skip normal-end，不被叫醒', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('parent'),
+      observeSession: async (id: string) =>
+        id === 'child-1'
+          ? {
+              events: [
+                { type: 'turn/start', time: NOW - 2 * HOUR },
+                { type: 'turn/end', time: NOW - 2 * HOUR, data: { turn: 1, reason: { kind: 'error', error: { message: 'x' } } } },
+              ],
+            }
+          : { events: parentWithSettledChild('child-1') },
+    })
+    const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
+    expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({ action: 'skip', cause: 'normal-end' })
+    expect(rows.find((row) => row.sessionId === 'parent')?.childNotes).toEqual([
+      { childId: 'child-1', detail: '已经向主会话报告过（结算通知在案）' },
+    ])
+  })
+})

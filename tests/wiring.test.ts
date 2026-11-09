@@ -74,7 +74,8 @@ describe('apply 行为', async () => {
     apply: (ctx: unknown, config: unknown) => void
   }
 
-  const NOW = new Date('2026-11-07T02:00:00').getTime()
+  // 时间基准取「当下」：写死日期会隔天掉出 24 小时窗口（2026-11-09 现场：三个用例集体变红）
+  const NOW = Date.now()
 
   function fakeServices() {
     const prompts: Array<{ sessionId: string }> = []
@@ -194,7 +195,7 @@ describe('apply 行为：子会话恢复', async () => {
     apply: (ctx: unknown, config: unknown) => void
   }
 
-  const NOW = new Date('2026-11-07T02:00:00').getTime()
+  const NOW = Date.now()
   const HOUR = 3_600_000
 
   /** 父会话：一轮正常结束 + 子代理目录事实。 */
@@ -271,7 +272,7 @@ describe('apply 行为：旧版子代理服务（只有 sendMessage）', async (
     apply: (ctx: unknown, config: unknown) => void
   }
 
-  const NOW = new Date('2026-11-07T02:00:00').getTime()
+  const NOW = Date.now()
   const HOUR = 3_600_000
 
   it('没有 queuePrompt 时退回 sendMessage，子会话照样被拉起来', async () => {
