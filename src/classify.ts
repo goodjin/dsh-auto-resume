@@ -21,11 +21,8 @@ export interface SessionEventLike {
   data?: Record<string, unknown>
 }
 
-/**
- * 继续的原因：崩溃中断 / 运行出错 / 桌面版退出 / 排队消息未投递 /
- * 主会话在等一个被中断的子会话。
- */
-export type ContinueCause = 'interrupted' | 'error' | 'disposed' | 'queued' | 'awaiting-child'
+/** 继续的原因：崩溃中断 / 运行出错 / 桌面版退出 / 排队消息未投递。 */
+export type ContinueCause = 'interrupted' | 'error' | 'disposed' | 'queued'
 
 /** 判定结果：继续（带原因与细节）或跳过（带跳过原因）。 */
 export type Verdict =

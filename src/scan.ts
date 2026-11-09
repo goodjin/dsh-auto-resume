@@ -10,7 +10,7 @@
  */
 
 import { classifySession, type ClassifyOptions, type SessionEventLike, type Verdict } from './classify.ts'
-import { catalogChildren, childNeedsResume, hasLocalSession, reportedChildIds, type PendingChild } from './children.ts'
+import { catalogChildren, hasLocalSession, reportedChildIds } from './children.ts'
 import type { RecentCandidate } from './recent.ts'
 
 /** 扫描需要的最小宿主服务面（测试立桩照这个来）。 */
@@ -19,7 +19,11 @@ export interface ScanHosts {
     listSessions(): Promise<SessionRecordLike[]>
     observeSession(id: string): Promise<SessionObservationLike>
   }
-  agents: { get(id: string): { status?: string } | undefined }
+  agents: {
+    get(id: string): { status?: string } | undefined
+    /** 把持久会话挂上线（不带消息）；子会话投递前用它把父会话挂起来。 */
+    resume?(options: { resumeSessionId: string }): Promise<unknown>
+  }
   workspaceRegistry: { archivedSessionIds: readonly string[] }
   /** 缺席时跳过 mtime 预筛（功能不缺，只慢一点）。 */
   sessionPersistence?: { stat(id: string): Promise<StatLike | undefined> }
@@ -66,8 +70,8 @@ export interface ScanLedgerRow {
   cause: string
   detail?: string
   lastTime: number
-  /** 待恢复的子会话（cause 为 `awaiting-child` 时有值）。 */
-  children?: PendingChild[]
+  /** 该行是子会话时，它的父会话 id（投递走子代理路由的正门，不走通用 prompt）。 */
+  parentSessionId?: string
   /** 子会话判定过程中的异常（读不出来等），只为查账，不影响判定。 */
   childNotes?: Array<{ childId: string; detail: string }>
 }
@@ -132,11 +136,12 @@ export async function scanSessions(
   recentCandidates.sort((a, b) => b.mtime - a.mtime)
   const budget = { left: options.maxChildObservations }
   for (const { record } of recentCandidates.slice(0, Math.max(options.maxObservations, 0))) {
-    const row = await judgeCandidate(hosts, record.header.id, options, budget)
-    rows.push({
-      ...row,
-      ...(record.header.cwd === undefined ? {} : { cwd: record.header.cwd }),
-    })
+    for (const row of await judgeCandidate(hosts, record.header.id, options, budget)) {
+      rows.push({
+        ...row,
+        ...(record.header.cwd === undefined || row.parentSessionId !== undefined ? {} : { cwd: record.header.cwd }),
+      })
+    }
   }
   return rows
 }
@@ -270,67 +275,61 @@ async function observeTimed(hosts: ScanHosts, sessionId: string): Promise<TimedO
 }
 
 /**
- * 判定一个候选会话，并回答「主会话是不是在等一个被中断的子会话」。
+ * 判定一个候选会话，返回账目行（可能不止一行：主会话 + 需要续的子会话）。
  *
  * 主会话自己异常收尾 → 照旧续它；
  * 主会话正常收尾（模型结束轮次去等子代理）→ 看它的子代理目录：若某个子会话
- * 自己也是异常收尾且没交过结算，那这就是「等子会话」的形态 → 主会话也要叫醒，
- * 并把那些子会话一并恢复（cause: awaiting-child）。
+ * 自己也是异常收尾且没向主会话报告过，那**该续的是子会话本身**——主会话不动
+ * （它没被打扰，不会重做已完成的活），子会话跑完会由宿主把结算通知送到主会话。
  */
 async function judgeCandidate(
   hosts: ScanHosts,
   sessionId: string,
   options: ClassifyOptions & { maxChildObservations: number },
   budget: { left: number },
-): Promise<ScanLedgerRow> {
+): Promise<ScanLedgerRow[]> {
   const observed = await observeTimed(hosts, sessionId)
   if (!observed.ok) {
-    return { sessionId, action: 'skip', cause: `error: ${observed.detail}`, lastTime: 0 }
+    return [{ sessionId, action: 'skip', cause: `error: ${observed.detail}`, lastTime: 0 }]
   }
   try {
     if (isSubagentHeader(observed.observation.header)) {
-      return { sessionId, action: 'skip', cause: 'subagent', lastTime: 0 }
+      return [{ sessionId, action: 'skip', cause: 'subagent', lastTime: 0 }]
     }
     const events = observed.observation.events
     const verdict = classifySession(events, options)
     if (verdict.action === 'continue' || verdict.cause !== 'normal-end') {
-      return ledgerRowOfId(sessionId, verdict)
+      return [ledgerRowOfId(sessionId, verdict)]
     }
-    const { pending, notes } = await pendingChildren(hosts, events, options, budget)
-    if (pending.length === 0) {
-      return {
-        ...ledgerRowOfId(sessionId, verdict),
-        ...(notes.length === 0 ? {} : { childNotes: notes }),
-      }
-    }
-    return {
-      sessionId,
-      action: 'continue',
-      cause: 'awaiting-child',
-      lastTime: verdict.lastTime,
-      children: pending,
+    const { rows, notes } = await pendingChildRows(hosts, sessionId, events, options, budget)
+    const parentRow: ScanLedgerRow = {
+      ...ledgerRowOfId(sessionId, verdict),
       ...(notes.length === 0 ? {} : { childNotes: notes }),
     }
+    return [parentRow, ...rows]
   } finally {
     observed.observation[Symbol.dispose]?.()
   }
 }
 
 /**
- * 找出父会话下「被中断、值得恢复」的子会话。
+ * 找出父会话下「被中断、值得恢复」的子会话，产出它们的投递行。
+ *
  * 子会话的日志说了算：轮次还开着（宿主冷读补 `interrupted`）或异常收尾 → 续。
+ * 已经向主会话报告过结果的（结算通知在案）不算——主会话知道结果了，再续就是重做。
+ * 外部后端（Codex/Claude Code/ACP）没有本地会话日志，续不了，交给主会话重新委派。
  */
-async function pendingChildren(
+async function pendingChildRows(
   hosts: ScanHosts,
+  parentId: string,
   parentEvents: readonly SessionEventLike[],
   options: ClassifyOptions,
   budget: { left: number },
-): Promise<{ pending: PendingChild[]; notes: Array<{ childId: string; detail: string }> }> {
-  const pending: PendingChild[] = []
+): Promise<{ rows: ScanLedgerRow[]; notes: Array<{ childId: string; detail: string }> }> {
+  const rows: ScanLedgerRow[] = []
   const notes: Array<{ childId: string; detail: string }> = []
   // 已经向主会话报告过的子会话（结算通知在案）不算「还在等」——主会话知道结果了，
-  // 把它叫醒是多余的（2026-11-09 现场：正常结束的会话被子会话的错误通知
-  // 拖去重跑）。
+  // 把它叫醒是多余的（2026-11-09 现场：正常结束的会话被子会话的失败通知拖去重跑）。
   const reported = reportedChildIds(parentEvents)
   // 目录按创建顺序追加，**新的在后面**：被中断的通常是最新的那个，所以倒着看，
   // 观察预算有限时先看它。
@@ -352,15 +351,22 @@ async function pendingChildren(
       continue
     }
     try {
-      const verdict = childNeedsResume(observed.observation.events, options)
-      if (verdict.needs && verdict.cause !== undefined) {
-        pending.push({ childId: child.childId, cause: verdict.cause })
+      const verdict = classifySession(observed.observation.events, options)
+      if (verdict.action === 'continue') {
+        rows.push({
+          sessionId: child.childId,
+          action: 'continue',
+          cause: verdict.cause,
+          lastTime: verdict.lastTime,
+          ...(verdict.detail === undefined ? {} : { detail: verdict.detail }),
+          parentSessionId: parentId,
+        })
       }
     } finally {
       observed.observation[Symbol.dispose]?.()
     }
   }
-  return { pending, notes }
+  return { rows, notes }
 }
 
 /** 快速通道：fs 直查候选 → 运行中/归档过滤 → 带超时观察判定。 */
@@ -389,7 +395,7 @@ async function scanViaRecent(
       progress?.(scanned, candidates.length)
       continue
     }
-    rows.push(await judgeCandidate(hosts, candidate.sessionId, options, budget))
+    rows.push(...(await judgeCandidate(hosts, candidate.sessionId, options, budget)))
     progress?.(scanned, candidates.length)
   }
   return rows

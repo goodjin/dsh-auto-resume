@@ -242,17 +242,20 @@ describe('scanSessions：主会话在等子会话', () => {
     ]
   }
 
-  it('父会话正常结束 + 子会话被中断 → 父会话 continue（cause awaiting-child），并带上子会话', async () => {
+  it('父会话正常结束 + 子会话被中断 → 续的是子会话本身，主会话不动', async () => {
     const hosts = makeHosts({
       listSessions: listing('parent'),
       observeSession: async (id: string) =>
         id === 'child-1' ? { events: childInterrupted() } : { events: parentEvents('child-1') },
     })
     const rows = await scanSessions(hosts, OPTS, RECENT_MTIME)
-    expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({
+    // 主会话照旧跳过（没被打扰，就不会重做已完成的活）
+    expect(rows.find((row) => row.sessionId === 'parent')).toMatchObject({ action: 'skip', cause: 'normal-end' })
+    // 子会话成为投递目标，标记走子代理路由的正门
+    expect(rows.find((row) => row.sessionId === 'child-1')).toMatchObject({
       action: 'continue',
-      cause: 'awaiting-child',
-      children: [{ childId: 'child-1', cause: 'interrupted' }],
+      cause: 'interrupted',
+      parentSessionId: 'parent',
     })
   })
 

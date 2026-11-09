@@ -1,5 +1,5 @@
 /**
- * 子会话（子代理）识别：父会话在等一个被中断的子会话。
+ * 子会话（子代理）识别：主会话正常收尾，但它名下有被中断、还没报告过的子会话。
  *
  * 场景（2026-11-07 现场）：主会话已经输出完回答块、正在等子会话主动回话，
  * 此时退出应用——主会话那一轮是**正常结束**的（宿主教模型「只剩等子代理结果
@@ -10,12 +10,14 @@
  * - 父会话的 `subagent/catalog` 事实记录了它有哪些子会话（只记成员关系，
  *   不记执行状态）；
  * - 子会话自己的日志尾部说了算：轮次还开着 → 宿主冷读补出的收尾是
- *   `interrupted`（被杀）/ `disposed`（退出）→ 属于异常中断，值得续。
+ *   `interrupted`（被杀）/ `disposed`（退出）→ 属于异常中断，值得续；
+ * - 子会话已经向主会话报告过结果的（结算通知在案）不算——主会话知道结果了，
+ *   再续就是重做。
  *
  * @module @goodjin2/dsh-auto-resume/children
  */
 
-import { classifySession, type ClassifyOptions, type ContinueCause, type SessionEventLike } from './classify.ts'
+import type { SessionEventLike } from './classify.ts'
 
 /** 父会话目录里的一个子会话。 */
 export interface CatalogChild {
@@ -25,17 +27,7 @@ export interface CatalogChild {
   createdAt?: number
 }
 
-/** 一个待恢复的子会话。 */
-export interface PendingChild {
-  childId: string
-  /** 子会话自己的中断原因（interrupted / disposed / error …）。 */
-  cause: ContinueCause
-}
-
-/**
- * 从父会话的事件流里取出子代理目录。
- * 每创建一个子会话，宿主就往父会话追加一条 `subagent/catalog` 事实。
- */
+/** 从父会话的事件流里取出子代理目录（每创建一个子会话追加一条事实）。 */
 export function catalogChildren(events: readonly SessionEventLike[]): CatalogChild[] {
   const children: CatalogChild[] = []
   const seen = new Set<string>()
@@ -56,19 +48,6 @@ export function catalogChildren(events: readonly SessionEventLike[]): CatalogChi
     })
   }
   return children
-}
-
-/**
- * 子会话是否值得恢复：它自己的判定结果是「该续」才算。
- * 正常结束、用户主动停过、空白会话都算不用管。
- */
-export function childNeedsResume(
-  events: readonly SessionEventLike[],
-  options: ClassifyOptions,
-): { needs: boolean; cause?: ContinueCause } {
-  const verdict = classifySession(events, options)
-  if (verdict.action !== 'continue') return { needs: false }
-  return { needs: true, cause: verdict.cause }
 }
 
 /**

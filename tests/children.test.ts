@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { catalogChildren, childNeedsResume, hasLocalSession, reportedChildIds } from '../src/children.ts'
+import { catalogChildren, hasLocalSession, reportedChildIds } from '../src/children.ts'
 import type { SessionEventLike } from '../src/classify.ts'
 
 const NOW = new Date('2026-11-07T02:00:00').getTime()
@@ -51,24 +51,6 @@ describe('catalogChildren：父会话的子代理目录', () => {
 
   it('形状不对的事实跳过，不抛', () => {
     expect(catalogChildren([{ type: 'subagent/catalog', time: NOW, data: { childId: 42 } }])).toEqual([])
-  })
-})
-
-describe('childNeedsResume：子会话要不要续', () => {
-  it('异常收尾 → 要续（原因带出来）', () => {
-    expect(childNeedsResume(interruptedEvents(), OPTS)).toEqual({ needs: true, cause: 'interrupted' })
-  })
-
-  it('正常完成 → 不用续', () => {
-    expect(childNeedsResume(completedEvents(), OPTS)).toEqual({ needs: false })
-  })
-
-  it('用户主动停过 → 不用续', () => {
-    const events: SessionEventLike[] = [
-      { type: 'turn/start', time: NOW - HOUR },
-      { type: 'turn/end', time: NOW - HOUR, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } } },
-    ]
-    expect(childNeedsResume(events, OPTS)).toEqual({ needs: false })
   })
 })
 

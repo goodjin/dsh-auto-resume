@@ -174,7 +174,7 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
       cause: row.cause as ContinueCause,
       ...(row.detail === undefined ? {} : { detail: row.detail }),
       lastTime: row.lastTime,
-      ...(row.children === undefined ? {} : { children: row.children }),
+      ...(row.parentSessionId === undefined ? {} : { parentSessionId: row.parentSessionId }),
     }))
   const deliverIo: DeliverIo = {
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -194,17 +194,21 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
 
   snapshot.rows = rows
   snapshot.deliveries = deliveries
+  const childIds = new Set(rows.filter((row) => row.parentSessionId !== undefined).map((row) => row.sessionId))
   snapshot.children = {
     serviceAvailable: subagentsService !== null,
-    pending: rows.reduce((sum, row) => sum + (row.children?.length ?? 0), 0),
-    resumed: deliveries.flatMap((delivery) =>
-      (delivery.children ?? []).map((child) => ({
-        parentId: delivery.sessionId,
-        childId: child.childId,
-        ok: child.ok,
-        ...(child.detail === undefined ? {} : { detail: child.detail }),
-      })),
-    ),
+    pending: childIds.size,
+    resumed: deliveries
+      .filter((delivery) => childIds.has(delivery.sessionId))
+      .map((delivery) => {
+        const target = targets.find((item) => item.sessionId === delivery.sessionId)
+        return {
+          parentId: target?.parentSessionId ?? '',
+          childId: delivery.sessionId,
+          ok: delivery.ok,
+          ...(delivery.detail === undefined ? {} : { detail: delivery.detail }),
+        }
+      }),
   }
   snapshot.finishedAt = Date.now()
   console.info(summarize(snapshot))
@@ -218,7 +222,16 @@ function childResumeHostOf(ctx: PluginContext, io: DeliverIo): ChildResumeHost |
   if (subagentsService === null) return undefined
   const service = subagentsService
   return {
-    parentAgent: (sessionId: string) => ctx.agents.get(sessionId),
+    // 父会话已在内存里就原样用；不在就把它挂上线（resume 只挂线，不带消息——
+    // 主会话没被打扰就不会重做已完成的活）。
+    attachParent: async (sessionId: string) => {
+      const live = ctx.agents.get(sessionId)
+      if (live !== undefined) return live
+      const handle = (await ctx.agents.resume?.({ resumeSessionId: sessionId })) as
+        | { agent?: unknown }
+        | undefined
+      return handle?.agent ?? handle
+    },
     queueChildPrompt: async (parent, childId, content, signal) => {
       if (typeof service.queuePrompt === 'function') {
         return service.queuePrompt(

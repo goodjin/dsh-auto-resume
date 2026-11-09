@@ -215,9 +215,10 @@ describe('apply 行为：子会话恢复', async () => {
     { type: 'turn/end', time: NOW - 2 * HOUR, data: { turn: 1, reason: { kind: 'interrupted' } } },
   ]
 
-  it('父会话被叫醒后，被中断的子会话经子代理服务被拉起来', async () => {
+  it('主会话不投消息；父会话挂上线后，被中断的子会话经子代理服务被拉起来', async () => {
     const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
     const prompts: Array<{ sessionId: string }> = []
+    const resumed: string[] = []
     const queued: Array<{ parent: unknown; childId: string; content: string }> = []
     const services: Record<string, unknown> = {
       sessionQuery: {
@@ -230,7 +231,12 @@ describe('apply 行为：子会话恢复', async () => {
       },
       agents: {
         get(id: string) {
-          return id === 'parent' ? { id: 'parent' } : undefined
+          // 父会话不在线：插件要先把父会话挂上线，才有资格往子会话投递
+          return undefined
+        },
+        async resume(options: { resumeSessionId: string }) {
+          resumed.push(options.resumeSessionId)
+          return { agent: { id: options.resumeSessionId } }
         },
       },
       workspaceRegistry: { archivedSessionIds: [] },
@@ -255,9 +261,11 @@ describe('apply 行为：子会话恢复', async () => {
     const { ctx } = makeCtx(services)
     apply(ctx, { startupDelayMs: 0, staggerMs: 0 })
     await new Promise((resolve) => setTimeout(resolve, 30))
-    expect(prompts.map((call) => call.sessionId)).toEqual(['parent'])
+    // 主会话不投消息
+    expect(prompts).toEqual([])
+    // 父会话先挂上线，子会话随后被拉起来
+    expect(resumed).toEqual(['parent'])
     expect(queued.map((call) => call.childId)).toEqual(['child-1'])
-    expect(queued[0]?.parent).toEqual({ id: 'parent' })
     const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
     expect(logged).toContain('children=service:present')
     expect(logged).toContain('pending=1')
@@ -265,7 +273,6 @@ describe('apply 行为：子会话恢复', async () => {
     infoSpy.mockRestore()
   })
 })
-
 
 describe('apply 行为：旧版子代理服务（只有 sendMessage）', async () => {
   const { apply } = (await import('../src/index.ts')) as {
