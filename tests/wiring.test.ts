@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { SessionEventLike } from '../src/classify.ts'
 import { fileURLToPath } from 'node:url'
 import { join, dirname } from 'node:path'
@@ -367,6 +369,9 @@ describe('apply 行为：暂时性失败的周期重试登记', async () => {
 
   it('暂时性失败的会话投出去之后，登记进周期重试账本', async () => {
     const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    // 账本落在 <DSH_HOME>/auto-resume 下：测试用临时目录，别碰真账本
+    const originalHome = process.env.DSH_HOME
+    process.env.DSH_HOME = join(tmpdir(), `auto-resume-test-${Math.random().toString(36).slice(2)}`)
     const prompts: Array<{ sessionId: string }> = []
     const services: Record<string, unknown> = {
       sessionQuery: {
@@ -398,5 +403,7 @@ describe('apply 行为：暂时性失败的周期重试登记', async () => {
     const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
     expect(logged).toContain('retryActive=[rate-limited(1次/失败0)]')
     infoSpy.mockRestore()
+    if (originalHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = originalHome
   })
 })

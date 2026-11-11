@@ -272,7 +272,9 @@ async function runRetryCycle(ctx: PluginContext, config: ResolvedConfig): Promis
       maxRetries: config.maxRetries,
     },
   )
-  saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), ledger)
+  const didSomething =
+    report.recovered.length > 0 || report.retried.length > 0 || report.abandoned.length > 0 || report.dropped.length > 0
+  if (didSomething) saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), ledger)
   snapshot.retries.lastTick = report
   snapshot.retries.active = Object.values(ledger.active).map((entry) => ({
     sessionId: entry.sessionId,
@@ -346,6 +348,7 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
   // 连续失败到上限就放弃并标记不再重试。已放弃的会话不会走到这里（扫描层已拦）。
   if (retryLedger !== null && config.retryIntervalMs > 0) {
     const delivered = new Map(deliveries.map((delivery) => [delivery.sessionId, delivery]))
+    let ledgerDirty = false
     for (const row of rows) {
       if (row.action !== 'continue' || row.cause !== 'error') continue
       if (!isTransientErrorDetail(row.detail)) continue
@@ -364,14 +367,18 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
         registeredAt: entry?.registeredAt ?? snapshot.startedAt,
         ...(row.parentSessionId === undefined ? {} : { parentId: row.parentSessionId }),
       }
+      ledgerDirty = true
     }
-    saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), retryLedger)
-    snapshot.retries.active = Object.values(retryLedger.active).map((entry) => ({
-      sessionId: entry.sessionId,
-      attempts: entry.attempts,
-      failures: entry.failures,
-      ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
-    }))
+    // 没变化就不落盘（每次启动都写一遍，等于把账本当成日志用）。
+    if (ledgerDirty) {
+      saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), retryLedger)
+      snapshot.retries.active = Object.values(retryLedger.active).map((entry) => ({
+        sessionId: entry.sessionId,
+        attempts: entry.attempts,
+        failures: entry.failures,
+        ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
+      }))
+    }
   }
 
   const childIds = new Set(rows.filter((row) => row.parentSessionId !== undefined).map((row) => row.sessionId))
