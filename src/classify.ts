@@ -69,17 +69,45 @@ function reasonOf(event: SessionEventLike): Record<string, unknown> | undefined 
   return dataField(event, 'reason')
 }
 
-/** 把 error 失败对象收成一句可读摘要，截 200 字符。 */
+/** 把 error 失败对象收成一句可读摘要（带上稳定错误码），截 200 字符。 */
 function errorDetail(error: unknown): string | undefined {
   let text: string | undefined
+  let code: string | undefined
   if (typeof error === 'object' && error !== null) {
-    const message = (error as Record<string, unknown>).message
+    const record = error as Record<string, unknown>
+    const message = record.message
     text = typeof message === 'string' && message.trim() !== '' ? message : JSON.stringify(error)
+    code = typeof record.code === 'string' ? record.code : undefined
   } else if (error !== undefined && error !== null) {
     text = String(error)
   }
   if (text === undefined) return undefined
+  if (code !== undefined && code !== '' && !text.includes(code)) text = `${text} [${code}]`
   return text.length > 200 ? `${text.slice(0, 200)}…` : text
+}
+
+/**
+ * 「暂时性失败」的特征：网络断、超时、429 限速这类，过一会儿可能自己好。
+ * 摘要里带稳定错误码（如 `QUOTA_EXCEEDED`），按码或按字面匹配都行。
+ */
+const TRANSIENT_PATTERNS: RegExp[] = [
+  /\b429\b/,
+  /\b5(02|03|04)\b/,
+  /rate[ _-]?limit/i,
+  /too many requests/i,
+  /quota[ _-]?exceed/i,
+  /timeout|timed out/i,
+  /econn(reset|refused|aborted)|enotfound|eai_again|ehostunreach|enetunreach/i,
+  /socket hang up/i,
+  /fetch failed/i,
+  /network (error|unreachable)|temporarily unavailable|service unavailable/i,
+  /upstream (error|unavailable)|overloaded/i,
+]
+
+/** 一句话是不是「暂时性失败」（网络 / 限速 / 超时这类）。 */
+export function isTransientErrorDetail(detail: string | undefined): boolean {
+  if (detail === undefined || detail === '') return false
+  return TRANSIENT_PATTERNS.some((pattern) => pattern.test(detail))
 }
 
 /**

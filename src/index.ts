@@ -20,7 +20,10 @@ import { resolveConfig, type ResolvedConfig } from './config.ts'
 import type { ContinueCause } from './classify.ts'
 import { scanSessions, type RecentEnumeration, type ScanHosts, type ScanLedgerRow } from './scan.ts'
 import { listRecentByFs, sessionsRoot } from './recent.ts'
-import { deliverContinuations, type ChildResumeHost, type DeliveryResult, type DeliverIo, type PromptHost } from './deliver.ts'
+import { isTransientErrorDetail, type SessionEventLike } from './classify.ts'
+import { loadRetryLedger, saveRetryLedger, retryLedgerPath, type RetryLedger } from './retry-ledger.ts'
+import { runRetryTick, type RetrySessionDeps, type RetryTickReport } from './retry.ts'
+import { deliverContinuations, type ChildResumeHost, type DeliveryResult, type DeliveryTarget, type DeliverIo, type PromptHost } from './deliver.ts'
 import { registerHealthRoute, type HealthRouteContext } from './route.ts'
 
 export { Config } from './config.ts'
@@ -52,6 +55,22 @@ export interface ScanSnapshot {
   deliveries: DeliveryResult[]
   /** 子会话恢复的自报状态：服务在不在、恢复了谁。 */
   children: ChildReport
+  /** 暂时性失败会话的周期重试账目。 */
+  retries: RetryReport
+}
+
+/** 周期重试的账目（路由自报用）。 */
+export interface RetryReport {
+  /** 账本文件路径（读不出来时为空，等于没有周期重试）。 */
+  ledgerPath: string | null
+  /** 还在重试周期里的会话。 */
+  active: Array<{ sessionId: string; attempts: number; failures: number; parentId?: string }>
+  /** 已放弃、不再重试的会话。 */
+  abandoned: Array<{ sessionId: string; reason: string; attempts: number }>
+  /** 最近一轮重试的动作。 */
+  lastTick: RetryTickReport | null
+  /** 启动扫描时因为「已放弃」被跳过的会话。 */
+  abandonedSkipped: Array<{ sessionId: string; reason: string }>
 }
 
 /** 子会话恢复的账目（路由自报用）。 */
@@ -72,6 +91,12 @@ let latestSnapshot: ScanSnapshot | null = null
  * 走 `ctx.inject` 机会式取用——服务在场才启用子会话恢复，缺席就只续父会话。
  */
 let subagentsService: SubagentsService | null = null
+
+/** 重试账本（进程内一份，落盘在 <DSH_HOME>/auto-resume/retry-ledger.json）。 */
+let retryLedger: RetryLedger | null = null
+let retryLedgerPathValue: string | null = null
+/** 重试周期是否正在跑（防止上一轮没跑完又起一轮）。 */
+let retryTickRunning = false
 
 /**
  * 子代理服务需要的最小面（测试立桩照这个来）。
@@ -113,6 +138,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
     rows: [],
     deliveries: [],
     children: { serviceAvailable: false, pending: 0, resumed: [] },
+    retries: { ledgerPath: null, active: [], abandoned: [], lastTick: null, abandonedSkipped: [] },
   }
 
   ctx.inject?.(['webServer'], (child) => {
@@ -132,6 +158,16 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
 
   if (!config.enabled) return
 
+  // 重试账本：装载即读（放弃标记要拦启动扫描，账本得先到位）。
+  retryLedgerPathValue = retryLedgerPath()
+  retryLedger = loadRetryLedger(retryLedgerPathValue)
+  latestSnapshot.retries.ledgerPath = retryLedgerPathValue
+  latestSnapshot.retries.abandoned = Object.entries(retryLedger.abandoned).map(([sessionId, entry]) => ({
+    sessionId,
+    reason: entry.reason,
+    attempts: entry.attempts,
+  }))
+
   // 排期与插件 fiber 同生命周期：行卸载时清掉还没到点的定时器。
   ctx.effect(() => {
     const timer = setTimeout(() => {
@@ -140,8 +176,118 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
       })
     }, config.startupDelayMs)
     timer.unref?.()
-    return () => clearTimeout(timer)
-  }, 'auto-resume: 启动扫描排期')
+
+    // 周期重试：暂时性失败（网络 / 限速 / 超时）的会话每过一段再投一次，
+    // 连续失败到上限就放弃并标记不再重试。整个回调就地兜底——宿主把没人接的
+    // 异常当致命错误，一条漏网的就能把整个进程带崩。
+    let interval: NodeJS.Timeout | undefined
+    if (config.retryIntervalMs > 0) {
+      interval = setInterval(() => {
+        if (retryTickRunning) return
+        retryTickRunning = true
+        runRetryCycle(ctx, config)
+          .catch((error: unknown) => {
+            console.error('auto-resume: 周期重试失败', error)
+          })
+          .finally(() => {
+            retryTickRunning = false
+          })
+      }, config.retryIntervalMs)
+      interval.unref?.()
+    }
+    return () => {
+      clearTimeout(timer)
+      if (interval !== undefined) clearInterval(interval)
+    }
+  }, 'auto-resume: 启动扫描与重试排期')
+}
+
+/** 带硬超时的观察（周期重试用）；租约由调用方释放。 */
+async function observeSessionTimed(
+  ctx: PluginContext,
+  sessionId: string,
+): Promise<
+  | { ok: true; observation: { events: SessionEventLike[]; [Symbol.dispose]?: () => void } }
+  | { ok: false; detail: string }
+> {
+  try {
+    const observation = await Promise.race([
+      ctx.sessionQuery.observeSession(sessionId),
+      new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('observeSession 超时（15000ms）')), 15_000)
+        timer.unref?.()
+      }),
+    ])
+    return { ok: true, observation }
+  } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** 跑一轮周期重试：看走向、该投的投、该放弃的放弃，账本落盘、快照更新。 */
+async function runRetryCycle(ctx: PluginContext, config: ResolvedConfig): Promise<void> {
+  const snapshot = latestSnapshot
+  const ledger = retryLedger
+  if (snapshot === null || ledger === null) return
+
+  const now = Date.now()
+  const report = await runRetryTick(
+    ledger,
+    {
+      observe: async (sessionId: string) => {
+        const running = hostsOf(ctx).agents.get(sessionId)?.status === 'running'
+        const observed = await observeSessionTimed(ctx, sessionId)
+        if (!observed.ok) return { ok: false as const, detail: observed.detail }
+        const dispose = observed.observation[Symbol.dispose]
+        return {
+          ok: true as const,
+          events: observed.observation.events,
+          running,
+          ...(dispose === undefined ? {} : { dispose }),
+        }
+      },
+      deliver: async (target: DeliveryTarget) => {
+        const [result] = await deliverContinuations(
+          [target],
+          ctx.sessionController,
+          config.messageTemplate,
+          0,
+          { sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), uuid: () => randomUUID() },
+          childResumeHostOf(ctx, {
+            sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+            uuid: () => randomUUID(),
+          }),
+          config.childMessageTemplate,
+        )
+        return (
+          result ?? { sessionId: target.sessionId, ok: false, detail: '投递通道没有返回结果' }
+        )
+      },
+    },
+    {
+      now,
+      lookbackHours: config.lookbackHours,
+      includeError: config.includeError,
+      includeDisposed: config.includeDisposed,
+      maxRetries: config.maxRetries,
+    },
+  )
+  saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), ledger)
+  snapshot.retries.lastTick = report
+  snapshot.retries.active = Object.values(ledger.active).map((entry) => ({
+    sessionId: entry.sessionId,
+    attempts: entry.attempts,
+    failures: entry.failures,
+    ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
+  }))
+  snapshot.retries.abandoned = Object.entries(ledger.abandoned).map(([sessionId, entry]) => ({
+    sessionId,
+    reason: entry.reason,
+    attempts: entry.attempts,
+  }))
+  console.info(
+    `auto-resume: 重试周期 recovered=${report.recovered.length} retried=${report.retried.length} abandoned=${report.abandoned.length} skipped=${report.skipped.length} dropped=${report.dropped.length} active=${Object.keys(ledger.active).length}`,
+  )
 }
 
 /** 跑一次扫描 + 投递 + 记账 + 打一行统计。 */
@@ -159,6 +305,7 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
       includeDisposed: config.includeDisposed,
       maxObservations: config.maxObservations,
       maxChildObservations: config.resumeChildren ? config.maxChildObservations : 0,
+      ...(retryLedger === null ? {} : { abandoned: new Map(Object.entries(retryLedger.abandoned)) }),
     },
     { statMtime: statMtimeMs },
     (scanned, total) => {
@@ -194,6 +341,39 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
 
   snapshot.rows = rows
   snapshot.deliveries = deliveries
+
+  // 暂时性失败（网络 / 限速 / 超时）的会话登记进重试账本：周期到点再投，
+  // 连续失败到上限就放弃并标记不再重试。已放弃的会话不会走到这里（扫描层已拦）。
+  if (retryLedger !== null && config.retryIntervalMs > 0) {
+    const delivered = new Map(deliveries.map((delivery) => [delivery.sessionId, delivery]))
+    for (const row of rows) {
+      if (row.action !== 'continue' || row.cause !== 'error') continue
+      if (!isTransientErrorDetail(row.detail)) continue
+      const entry = retryLedger.active[row.sessionId]
+      const outcome = delivered.get(row.sessionId)
+      if (outcome !== undefined && !outcome.ok) {
+        // 这次投递本身没送进去：不登记周期重试，账目里留着失败原因。
+        continue
+      }
+      retryLedger.active[row.sessionId] = {
+        sessionId: row.sessionId,
+        ...(row.detail === undefined ? {} : { detail: row.detail }),
+        tailTime: row.lastTime,
+        attempts: (entry?.attempts ?? 0) + 1,
+        failures: entry?.failures ?? 0,
+        registeredAt: entry?.registeredAt ?? snapshot.startedAt,
+        ...(row.parentSessionId === undefined ? {} : { parentId: row.parentSessionId }),
+      }
+    }
+    saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), retryLedger)
+    snapshot.retries.active = Object.values(retryLedger.active).map((entry) => ({
+      sessionId: entry.sessionId,
+      attempts: entry.attempts,
+      failures: entry.failures,
+      ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
+    }))
+  }
+
   const childIds = new Set(rows.filter((row) => row.parentSessionId !== undefined).map((row) => row.sessionId))
   snapshot.children = {
     serviceAvailable: subagentsService !== null,
@@ -349,6 +529,9 @@ function summarize(snapshot: ScanSnapshot): string {
     `pending=${snapshot.children.pending}`,
     `resumed=${childOk}/${childRows.length}`,
     `childIds=[${childRows.map((child) => `${child.childId}${child.ok ? '' : ':失败'}`).join(',')}]`,
+    `retries=active:${snapshot.retries.active.length}`,
+    `retryActive=[${snapshot.retries.active.map((entry) => `${entry.sessionId}(${entry.attempts}次/失败${entry.failures})`).join(',')}]`,
+    `retryAbandoned=${snapshot.retries.abandoned.length}`,
   ].join(' ')
 }
 

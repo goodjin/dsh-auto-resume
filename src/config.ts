@@ -25,6 +25,10 @@ export interface AutoResumeConfig {
   maxChildObservations?: number
   /** 一次启动最多恢复多少个子会话。 */
   maxChildResumes?: number
+  /** 暂时性失败（网络 / 限速 / 超时）的会话按这个周期重试；0 = 不周期重试。 */
+  retryIntervalMs?: number
+  /** 连续失败到这个数就放弃并标记不再重试。 */
+  maxRetries?: number
   messageTemplate?: string
   /** 给子会话的继续消息模板（{parent}/{reason}/{time} 占位符）。 */
   childMessageTemplate?: string
@@ -42,6 +46,8 @@ export interface ResolvedConfig {
   resumeChildren: boolean
   maxChildObservations: number
   maxChildResumes: number
+  retryIntervalMs: number
+  maxRetries: number
   messageTemplate: string
   childMessageTemplate: string
 }
@@ -70,6 +76,8 @@ export const Config: Schema<AutoResumeConfig> = Schema.object({
   resumeChildren: Schema.boolean().default(true),
   maxChildObservations: Schema.number().default(20),
   maxChildResumes: Schema.number().default(10),
+  retryIntervalMs: Schema.number().default(600_000),
+  maxRetries: Schema.number().default(3),
   messageTemplate: Schema.string().default(DEFAULT_MESSAGE_TEMPLATE),
   childMessageTemplate: Schema.string().default(DEFAULT_CHILD_MESSAGE_TEMPLATE),
 })
@@ -102,6 +110,8 @@ export function resolveConfig(raw: unknown): ResolvedConfig {
     resumeChildren: booleanOr(source.resumeChildren, true),
     maxChildObservations: nonNegative(source.maxChildObservations, 20),
     maxChildResumes: nonNegative(source.maxChildResumes, 10),
+    retryIntervalMs: nonNegative(source.retryIntervalMs, 600_000),
+    maxRetries: nonNegative(source.maxRetries, 3),
     messageTemplate:
       typeof source.messageTemplate === 'string' && source.messageTemplate.trim() !== ''
         ? source.messageTemplate

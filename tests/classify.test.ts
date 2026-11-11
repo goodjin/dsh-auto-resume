@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { classifySession, type SessionEventLike } from '../src/classify.ts'
+import { classifySession, isTransientErrorDetail, type SessionEventLike } from '../src/classify.ts'
 
 /** now 固定值：2026-11-07 02:00:00 本地。 */
 const NOW = new Date('2026-11-07T02:00:00').getTime()
@@ -59,13 +59,22 @@ describe('classifySession：按最后一轮的结束原因', () => {
     expect(classifySession(events, OPTS)).toMatchObject({ action: 'continue', cause: 'interrupted' })
   })
 
-  it('error 且 includeError → continue error，detail 取 error.message', () => {
+  it('error 且 includeError → continue error，detail 带上 message 与稳定错误码', () => {
     const events = [
       ev('turn/start', 2),
       turnEnd({ kind: 'error', error: { message: 'fetch failed', code: 'ECONNRESET' } }, 2),
     ]
     const verdict = classifySession(events, OPTS)
-    expect(verdict).toMatchObject({ action: 'continue', cause: 'error', detail: 'fetch failed' })
+    expect(verdict).toMatchObject({ action: 'continue', cause: 'error', detail: 'fetch failed [ECONNRESET]' })
+  })
+
+  it('isTransientErrorDetail：网络 / 限速 / 超时算暂时性失败', () => {
+    expect(isTransientErrorDetail('Request failed with 429 Too Many Requests')).toBe(true)
+    expect(isTransientErrorDetail('fetch failed [QUOTA_EXCEEDED]')).toBe(true)
+    expect(isTransientErrorDetail('ECONNRESET at TCP.socket')).toBe(true)
+    expect(isTransientErrorDetail('upstream overloaded, try again')).toBe(true)
+    expect(isTransientErrorDetail('Cannot switch to acp:x/y: context compaction failed')).toBe(false)
+    expect(isTransientErrorDetail(undefined)).toBe(false)
   })
 
   it('error 且 includeError=false → skip error-excluded（账目里看得出是开关挡的）', () => {

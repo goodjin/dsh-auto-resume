@@ -61,6 +61,14 @@ function listing(...ids: string[]): ScanHosts['sessionQuery']['listSessions'] {
   return async () => ids.map((id) => ({ header: { id } }))
 }
 
+/** 一轮还在失败的会话事件（错误尾巴）。 */
+function failingEvents(at: number): SessionEventLike[] {
+  return [
+    { type: 'turn/start', time: at - 1_000 },
+    { type: 'turn/end', time: at, data: { turn: 1, reason: { kind: 'error', error: { message: 'fetch failed [QUOTA_EXCEEDED]' } } } },
+  ]
+}
+
 describe('scanSessions：扫描层过滤', () => {
   it('子代理会话（origin）与子会话（parentSession）→ skip，不读事件', async () => {
     const hosts = makeHosts({
@@ -376,5 +384,28 @@ describe('scanSessions：子会话已经报告过的不算「还在等」', () =
     expect(rows.find((row) => row.sessionId === 'parent')?.childNotes).toEqual([
       { childId: 'child-1', detail: '已经向主会话报告过（结算通知在案）' },
     ])
+  })
+})
+
+
+describe('scanSessions：已放弃的会话不再重试', () => {
+  it('放弃标记在案且日志没动静 → skip no-more-retries，不投递', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('given-up'),
+      observeSession: async () => ({ events: failingEvents(NOW - HOUR) }),
+    })
+    const abandoned = new Map([['given-up', { tailTime: NOW - HOUR }]])
+    const rows = await scanSessions(hosts, { ...OPTS, abandoned }, RECENT_MTIME)
+    expect(rows).toEqual([expect.objectContaining({ sessionId: 'given-up', action: 'skip', cause: 'no-more-retries' })])
+  })
+
+  it('放弃标记过期（会话有新动静）→ 不拦，照常判定', async () => {
+    const hosts = makeHosts({
+      listSessions: listing('moved-on'),
+      observeSession: async () => ({ events: failingEvents(NOW - HOUR) }),
+    })
+    const abandoned = new Map([['moved-on', { tailTime: NOW - 5 * HOUR }]])
+    const rows = await scanSessions(hosts, { ...OPTS, abandoned }, RECENT_MTIME)
+    expect(rows.find((row) => row.sessionId === 'moved-on')).toMatchObject({ action: 'continue', cause: 'error' })
   })
 })

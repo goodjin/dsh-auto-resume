@@ -14,6 +14,8 @@ describe('resolveConfig：缺省补默认、负数取 0', () => {
       resumeChildren: true,
       maxChildObservations: 20,
       maxChildResumes: 10,
+      retryIntervalMs: 600_000,
+      maxRetries: 3,
       messageTemplate: DEFAULT_MESSAGE_TEMPLATE,
       childMessageTemplate: DEFAULT_CHILD_MESSAGE_TEMPLATE,
     })
@@ -32,6 +34,12 @@ describe('resolveConfig：缺省补默认、负数取 0', () => {
     expect(resolved.resumeChildren).toBe(false)
     expect(resolved.maxChildObservations).toBe(0)
     expect(resolved.maxChildResumes).toBe(3)
+  })
+
+  it('重试周期与上限可配', () => {
+    const resolved = resolveConfig({ retryIntervalMs: 0, maxRetries: 5 })
+    expect(resolved.retryIntervalMs).toBe(0)
+    expect(resolved.maxRetries).toBe(5)
   })
 
   it('负数值取 0', () => {

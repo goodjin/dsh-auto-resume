@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
+import type { SessionEventLike } from '../src/classify.ts'
 import { fileURLToPath } from 'node:url'
 import { join, dirname } from 'node:path'
 
@@ -341,6 +342,61 @@ describe('apply 行为：旧版子代理服务（只有 sendMessage）', async (
     const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
     expect(logged).toContain('children=service:present')
     expect(logged).toContain('resumed=1/1')
+    infoSpy.mockRestore()
+  })
+})
+
+
+describe('apply 行为：暂时性失败的周期重试登记', async () => {
+  const { apply } = (await import('../src/index.ts')) as {
+    apply: (ctx: unknown, config: unknown) => void
+  }
+
+  const NOW = Date.now()
+  const HOUR = 3_600_000
+
+  /** 一轮被限速打断的会话事件。 */
+  const rateLimited: SessionEventLike[] = [
+    { type: 'turn/start', time: NOW - HOUR },
+    {
+      type: 'turn/end',
+      time: NOW - HOUR,
+      data: { turn: 1, reason: { kind: 'error', error: { message: '429 Too Many Requests', code: 'QUOTA_EXCEEDED' } } },
+    },
+  ]
+
+  it('暂时性失败的会话投出去之后，登记进周期重试账本', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const prompts: Array<{ sessionId: string }> = []
+    const services: Record<string, unknown> = {
+      sessionQuery: {
+        async listSessions() {
+          return [{ header: { id: 'rate-limited' } }]
+        },
+        async observeSession() {
+          return { events: rateLimited }
+        },
+      },
+      agents: { get: () => undefined },
+      workspaceRegistry: { archivedSessionIds: [] },
+      sessionRecent: {
+        async listRecent() {
+          return [{ sessionId: 'rate-limited', mtime: NOW - HOUR }]
+        },
+      },
+      sessionController: {
+        async prompt(request: { sessionId: string }) {
+          prompts.push(request)
+          return { accepted: true }
+        },
+      },
+    }
+    const { ctx } = makeCtx(services)
+    apply(ctx, { startupDelayMs: 0, staggerMs: 0, retryIntervalMs: 600_000, maxRetries: 3 })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(prompts.map((call) => call.sessionId)).toEqual(['rate-limited'])
+    const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(logged).toContain('retryActive=[rate-limited(1次/失败0)]')
     infoSpy.mockRestore()
   })
 })

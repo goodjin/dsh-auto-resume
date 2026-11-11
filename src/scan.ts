@@ -105,7 +105,11 @@ function skipRow(record: SessionRecordLike, cause: string): ScanLedgerRow {
  */
 export async function scanSessions(
   hosts: ScanHosts,
-  options: ClassifyOptions & { maxObservations: number; maxChildObservations: number },
+  options: ClassifyOptions & {
+    maxObservations: number
+    maxChildObservations: number
+    abandoned?: ReadonlyMap<string, { tailTime: number }>
+  },
   io: ScanIo,
   progress?: (scanned: number, total: number) => void,
   recent?: RecentEnumeration,
@@ -285,7 +289,7 @@ async function observeTimed(hosts: ScanHosts, sessionId: string): Promise<TimedO
 async function judgeCandidate(
   hosts: ScanHosts,
   sessionId: string,
-  options: ClassifyOptions & { maxChildObservations: number },
+  options: ClassifyOptions & { maxChildObservations: number; abandoned?: ReadonlyMap<string, { tailTime: number }> },
   budget: { left: number },
 ): Promise<ScanLedgerRow[]> {
   const observed = await observeTimed(hosts, sessionId)
@@ -297,6 +301,11 @@ async function judgeCandidate(
       return [{ sessionId, action: 'skip', cause: 'subagent', lastTime: 0 }]
     }
     const events = observed.observation.events
+    // 已放弃（连续重试失败到上限）且之后没有新动静 → 不再重试
+    const abandonedEntry = options.abandoned?.get(sessionId)
+    if (abandonedEntry !== undefined && events.at(-1)!.time <= abandonedEntry.tailTime) {
+      return [{ sessionId, action: 'skip', cause: 'no-more-retries', lastTime: events.at(-1)!.time }]
+    }
     const verdict = classifySession(events, options)
     if (verdict.action === 'continue' || verdict.cause !== 'normal-end') {
       return [ledgerRowOfId(sessionId, verdict)]
