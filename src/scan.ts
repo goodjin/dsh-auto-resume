@@ -109,6 +109,8 @@ export async function scanSessions(
     maxObservations: number
     maxChildObservations: number
     abandoned?: ReadonlyMap<string, { tailTime: number }>
+    /** 放弃标记已经过期（会话有新动静）时顺手删掉它，免得账本里堆死条目。 */
+    clearAbandoned?(sessionId: string): void
   },
   io: ScanIo,
   progress?: (scanned: number, total: number) => void,
@@ -289,7 +291,11 @@ async function observeTimed(hosts: ScanHosts, sessionId: string): Promise<TimedO
 async function judgeCandidate(
   hosts: ScanHosts,
   sessionId: string,
-  options: ClassifyOptions & { maxChildObservations: number; abandoned?: ReadonlyMap<string, { tailTime: number }> },
+  options: ClassifyOptions & {
+    maxChildObservations: number
+    abandoned?: ReadonlyMap<string, { tailTime: number }>
+    clearAbandoned?(sessionId: string): void
+  },
   budget: { left: number },
 ): Promise<ScanLedgerRow[]> {
   const observed = await observeTimed(hosts, sessionId)
@@ -301,10 +307,14 @@ async function judgeCandidate(
       return [{ sessionId, action: 'skip', cause: 'subagent', lastTime: 0 }]
     }
     const events = observed.observation.events
-    // 已放弃（连续重试失败到上限）且之后没有新动静 → 不再重试
+    // 已放弃（连续重试失败到上限）且之后没有新动静 → 不再重试；
+    // 会话有新动静了 → 标记过期，顺手删掉（不再只是被忽略地留着）。
     const abandonedEntry = options.abandoned?.get(sessionId)
-    if (abandonedEntry !== undefined && events.at(-1)!.time <= abandonedEntry.tailTime) {
-      return [{ sessionId, action: 'skip', cause: 'no-more-retries', lastTime: events.at(-1)!.time }]
+    if (abandonedEntry !== undefined) {
+      if (events.at(-1)!.time <= abandonedEntry.tailTime) {
+        return [{ sessionId, action: 'skip', cause: 'no-more-retries', lastTime: events.at(-1)!.time }]
+      }
+      options.clearAbandoned?.(sessionId)
     }
     const verdict = classifySession(events, options)
     if (verdict.action === 'continue' || verdict.cause !== 'normal-end') {

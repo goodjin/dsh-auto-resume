@@ -399,13 +399,15 @@ describe('scanSessions：已放弃的会话不再重试', () => {
     expect(rows).toEqual([expect.objectContaining({ sessionId: 'given-up', action: 'skip', cause: 'no-more-retries' })])
   })
 
-  it('放弃标记过期（会话有新动静）→ 不拦，照常判定', async () => {
+  it('放弃标记过期（会话有新动静）→ 不拦、照常判定，并顺手删掉标记', async () => {
     const hosts = makeHosts({
       listSessions: listing('moved-on'),
       observeSession: async () => ({ events: failingEvents(NOW - HOUR) }),
     })
     const abandoned = new Map([['moved-on', { tailTime: NOW - 5 * HOUR }]])
-    const rows = await scanSessions(hosts, { ...OPTS, abandoned }, RECENT_MTIME)
+    const cleared: string[] = []
+    const rows = await scanSessions(hosts, { ...OPTS, abandoned, clearAbandoned: (id) => cleared.push(id) }, RECENT_MTIME)
     expect(rows.find((row) => row.sessionId === 'moved-on')).toMatchObject({ action: 'continue', cause: 'error' })
+    expect(cleared).toEqual(['moved-on'])
   })
 })

@@ -359,7 +359,18 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
       includeDisposed: config.includeDisposed,
       maxObservations: config.maxObservations,
       maxChildObservations: config.resumeChildren ? config.maxChildObservations : 0,
-      ...(retryLedger === null ? {} : { abandoned: new Map(Object.entries(retryLedger.abandoned)) }),
+      ...(retryLedger === null
+        ? {}
+        : {
+            abandoned: new Map(Object.entries(retryLedger.abandoned)),
+            // 过期的放弃标记顺手删掉并落盘：会话有新动静就说明该重新登记了。
+            clearAbandoned: (sessionId: string) => {
+              if (retryLedger === null) return
+              delete retryLedger.abandoned[sessionId]
+              saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), retryLedger)
+              snapshot.retries.abandoned = ledgerAbandonedList()
+            },
+          }),
     },
     { statMtime: statMtimeMs },
     (scanned, total) => {
