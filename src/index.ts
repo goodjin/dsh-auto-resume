@@ -20,7 +20,7 @@ import { resolveConfig, type ResolvedConfig } from './config.ts'
 import type { ContinueCause } from './classify.ts'
 import { scanSessions, type RecentEnumeration, type ScanHosts, type ScanLedgerRow } from './scan.ts'
 import { listRecentByFs, sessionsRoot } from './recent.ts'
-import { isTransientErrorDetail, type SessionEventLike } from './classify.ts'
+import { errorDetail, isTransientErrorDetail, type SessionEventLike } from './classify.ts'
 import { loadRetryLedger, saveRetryLedger, retryLedgerPath, type RetryLedger } from './retry-ledger.ts'
 import { runRetryTick, type RetrySessionDeps, type RetryTickReport } from './retry.ts'
 import { deliverContinuations, type ChildResumeHost, type DeliveryResult, type DeliveryTarget, type DeliverIo, type PromptHost } from './deliver.ts'
@@ -39,6 +39,8 @@ interface PluginContext extends ScanHosts, HealthRouteContext {
   sessionController: PromptHost
   get?(serviceName: string): unknown
   inject?(deps: string[], body: (child: unknown) => void): unknown
+  /** 宿主广播的会话事件（轮次收尾等），用于「中止当下就登记」。 */
+  on?(eventName: string, listener: (subject: unknown, event: unknown) => void): unknown
 }
 
 /** 一次启动扫描的完整快照（路由账目就存这个）。 */
@@ -128,7 +130,7 @@ interface SubagentsService {
  */
 export function apply(ctx: PluginContext, rawConfig: unknown): void {
   const config = resolveConfig(rawConfig)
-  latestSnapshot = {
+  const snapshot: ScanSnapshot = {
     enabled: config.enabled,
     startedAt: null,
     finishedAt: null,
@@ -140,6 +142,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
     children: { serviceAvailable: false, pending: 0, resumed: [] },
     retries: { ledgerPath: null, active: [], abandoned: [], lastTick: null, abandonedSkipped: [] },
   }
+  latestSnapshot = snapshot
 
   ctx.inject?.(['webServer'], (child) => {
     registerHealthRoute(child as HealthRouteContext, () => latestSnapshot)
@@ -161,6 +164,55 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
   // 重试账本：装载即读（放弃标记要拦启动扫描，账本得先到位）。
   retryLedgerPathValue = retryLedgerPath()
   retryLedger = loadRetryLedger(retryLedgerPathValue)
+  snapshot.retries.ledgerPath = retryLedgerPathValue
+  snapshot.retries.abandoned = ledgerAbandonedList()
+
+  // 中止当下就登记：宿主广播会话事件，轮次以「暂时性失败」收尾的当场进账本，
+  // 不用等下一次启动扫描。整条回调就地兜底（宿主把没人接的异常当致命错误）。
+  ctx.on?.('session/event', (session: unknown, event: unknown) => {
+    try {
+      if (retryLedger === null || config.retryIntervalMs <= 0) return
+      const record = event as
+        | { type?: string; time?: number; data?: { reason?: { kind?: string; error?: unknown } } }
+        | undefined
+      if (record?.type !== 'turn/end') return
+      const sessionId = sessionOf(session)
+      if (sessionId === undefined) return
+      const kind = record.data?.reason?.kind
+      if (kind !== 'error') {
+        // 会话走出了失败状态：放弃标记的使命完成，摘掉（下次再失败照常登记）。
+        if (retryLedger.abandoned[sessionId] !== undefined) {
+          delete retryLedger.abandoned[sessionId]
+          saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), retryLedger)
+          snapshot.retries.abandoned = ledgerAbandonedList()
+          console.info(`auto-resume: 会话 ${sessionId} 已走出失败状态，解除「不再重试」标记`)
+        }
+        return
+      }
+      const detail = errorDetail(record.data?.reason?.error)
+      if (!isTransientErrorDetail(detail)) return
+      // 已放弃的会话不复活：连续失败到上限的标记要 hold 住
+      if (retryLedger.abandoned[sessionId] !== undefined) return
+      const existing = retryLedger.active[sessionId]
+      const parentId = sessionParentIdOf(session)
+      retryLedger.active[sessionId] = {
+        sessionId,
+        ...(detail === undefined ? {} : { detail }),
+        tailTime: record.time ?? Date.now(),
+        attempts: existing?.attempts ?? 0,
+        failures: existing?.failures ?? 0,
+        registeredAt: existing?.registeredAt ?? Date.now(),
+        ...(parentId === undefined ? {} : { parentId }),
+      }
+      saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), retryLedger)
+      snapshot.retries.active = ledgerActiveList()
+      console.info(
+        `auto-resume: 已登记暂时性失败会话 ${sessionId}${parentId === undefined ? '' : `（父 ${parentId}）`}，周期里会再试`,
+      )
+    } catch (error) {
+      console.error('auto-resume: 会话事件登记失败', error)
+    }
+  })
   latestSnapshot.retries.ledgerPath = retryLedgerPathValue
   latestSnapshot.retries.abandoned = Object.entries(retryLedger.abandoned).map(([sessionId, entry]) => ({
     sessionId,
@@ -399,6 +451,39 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
   }
   snapshot.finishedAt = Date.now()
   console.info(summarize(snapshot))
+}
+
+/** 从会话事件广播的会话对象里取 id（形状不对回 undefined）。 */
+function sessionOf(session: unknown): string | undefined {
+  const id = (session as { id?: unknown } | undefined)?.id
+  return typeof id === 'string' && id !== '' ? id : undefined
+}
+
+/** 子会话的父会话 id（顶层会话回 undefined）。 */
+function sessionParentIdOf(session: unknown): string | undefined {
+  const parentId = (session as { header?: { parentSession?: unknown } } | undefined)?.header?.parentSession
+  return typeof parentId === 'string' && parentId !== '' ? parentId : undefined
+}
+
+/** 账本放弃区 → 快照里的账目。 */
+function ledgerAbandonedList(): Array<{ sessionId: string; reason: string; attempts: number }> {
+  if (retryLedger === null) return []
+  return Object.entries(retryLedger.abandoned).map(([sessionId, entry]) => ({
+    sessionId,
+    reason: entry.reason,
+    attempts: entry.attempts,
+  }))
+}
+
+/** 账本活跃区 → 快照里的账目。 */
+function ledgerActiveList(): Array<{ sessionId: string; attempts: number; failures: number; parentId?: string }> {
+  if (retryLedger === null) return []
+  return Object.values(retryLedger.active).map((entry) => ({
+    sessionId: entry.sessionId,
+    attempts: entry.attempts,
+    failures: entry.failures,
+    ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
+  }))
 }
 
 /**

@@ -70,7 +70,7 @@ function reasonOf(event: SessionEventLike): Record<string, unknown> | undefined 
 }
 
 /** 把 error 失败对象收成一句可读摘要（带上稳定错误码），截 200 字符。 */
-function errorDetail(error: unknown): string | undefined {
+export function errorDetail(error: unknown): string | undefined {
   let text: string | undefined
   let code: string | undefined
   if (typeof error === 'object' && error !== null) {

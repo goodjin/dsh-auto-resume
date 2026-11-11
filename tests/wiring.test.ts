@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { SessionEventLike } from '../src/classify.ts'
@@ -405,4 +405,126 @@ describe('apply 行为：暂时性失败的周期重试登记', async () => {
     if (originalHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = originalHome
   })
+})
+
+
+describe('apply 行为：中止当下就登记', async () => {
+  const { apply } = (await import('../src/index.ts')) as {
+    apply: (ctx: unknown, config: unknown) => void
+  }
+
+  const NOW = Date.now()
+  const HOUR = 3_600_000
+
+  /** 造一个带事件监听器的假宿主。 */
+  function ctxWithEvents(services: Record<string, unknown>) {
+    const listeners: Record<string, Array<(subject: unknown, event: unknown) => void>> = {}
+    const ctx = {
+      ...services,
+      on(eventName: string, listener: (subject: unknown, event: unknown) => void) {
+        ;(listeners[eventName] ??= []).push(listener)
+      },
+      get(serviceName: string) {
+        return services[serviceName]
+      },
+      effect(factory: () => unknown) {
+        return factory()
+      },
+      inject(deps: string[], body: (child: unknown) => void) {
+        body({
+          webServer: { register: (route: unknown) => route },
+          effect: (factory: () => unknown) => factory(),
+          ...(services.subagents === undefined ? {} : { subagents: services.subagents }),
+        })
+      },
+    }
+    return { ctx, fire: (eventName: string, subject: unknown, event: unknown) => { for (const l of listeners[eventName] ?? []) l(subject, event) } }
+  }
+
+  const transientTurnEnd = {
+    type: 'turn/end',
+    time: NOW,
+    data: { turn: 1, reason: { kind: 'error', error: { message: '429 Too Many Requests', code: 'QUOTA_EXCEEDED' } } },
+  }
+  const completedTurnEnd = { type: 'turn/end', time: NOW, data: { turn: 2, reason: { kind: 'completed' } } }
+
+  it('轮次以暂时性失败收尾 → 当下进账本（子会话带上父会话）', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const originalHome = process.env.DSH_HOME
+    process.env.DSH_HOME = join(tmpdir(), `auto-resume-test-${Math.random().toString(36).slice(2)}`)
+    const { ctx, fire } = ctxWithEvents({
+      agents: { get: () => undefined },
+      sessionController: { prompt: async () => ({ accepted: true }) },
+    })
+    apply(ctx, { startupDelayMs: 500_000, retryIntervalMs: 600_000 })
+    fire('session/event', { id: 'child-9', header: { parentSession: 'parent-9' } }, transientTurnEnd)
+    const logged = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(logged).toContain('已登记暂时性失败会话 child-9（父 parent-9）')
+    infoSpy.mockRestore()
+    if (originalHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = originalHome
+  })
+
+  it('暂时性失败不匹配（比如正常完成）→ 不登记；放弃标记随之解除', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const originalHome = process.env.DSH_HOME
+    process.env.DSH_HOME = join(tmpdir(), `auto-resume-test-${Math.random().toString(36).slice(2)}`)
+    const { ctx, fire } = ctxWithEvents({})
+    apply(ctx, { startupDelayMs: 500_000, retryIntervalMs: 600_000 })
+    // 先造一个放弃标记
+    fire('session/event', { id: 'given-up' }, transientTurnEnd)
+    const marked = infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(marked).toContain('已登记暂时性失败会话 given-up')
+    infoSpy.mockRestore()
+    // 会话走出失败状态 → 标记解除（下次再失败照常登记）
+    const infoSpy2 = vi.spyOn(console, 'info').mockImplementation(() => {})
+    fire('session/event', { id: 'given-up' }, completedTurnEnd)
+    const cleared = infoSpy2.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(cleared).not.toContain('given-up')
+    infoSpy2.mockRestore()
+    if (originalHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = originalHome
+  })
+
+  it('已放弃的会话再次暂时性失败 → 不复活登记（标记 hold 住）', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const originalHome = process.env.DSH_HOME
+    const home = join(tmpdir(), `auto-resume-test-${Math.random().toString(36).slice(2)}`)
+    process.env.DSH_HOME = home
+    // 装载前就把放弃标记写进账本（启动扫描读得到，监听器也读得到）
+    const ledgerPath = join(home, 'auto-resume', 'retry-ledger.json')
+    mkdirSync(dirname(ledgerPath), { recursive: true })
+    writeFileSync(
+      ledgerPath,
+      JSON.stringify({
+        active: {},
+        abandoned: {
+          'given-up': {
+            sessionId: 'given-up',
+            tailTime: NOW,
+            abandonedAt: NOW,
+            attempts: 3,
+            reason: '连续 3 个周期仍在失败（fetch failed），不再重试',
+          },
+        },
+      }),
+    )
+    const { ctx, fire } = ctxWithEvents({})
+    apply(ctx, { startupDelayMs: 500_000, retryIntervalMs: 600_000 })
+    // 同一个会话又失败了一次 → 标记 hold 住，不复活登记
+    fire('session/event', { id: 'given-up' }, transientTurnEnd)
+    const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8')) as typeof ledgerShape
+    expect(onDisk.active['given-up']).toBeUndefined()
+    expect(onDisk.abandoned['given-up']).toBeDefined()
+    expect(infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')).not.toContain('已登记暂时性失败会话 given-up')
+    infoSpy.mockRestore()
+    if (originalHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = originalHome
+  })
+
+  /** 账本文件的形状（测试里做形状断言用）。 */
+  const ledgerShape = {
+    active: {} as Record<string, unknown>,
+    abandoned: {} as Record<string, unknown>,
+  }
 })
