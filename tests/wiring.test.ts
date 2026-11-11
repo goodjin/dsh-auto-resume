@@ -1,10 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { SessionEventLike } from '../src/classify.ts'
 import { fileURLToPath } from 'node:url'
-import { join, dirname } from 'node:path'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
