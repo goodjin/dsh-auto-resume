@@ -47,7 +47,7 @@ function ledgerWith(sessionId: string, over: Partial<{ failures: number; attempt
   return ledger
 }
 
-/** 造一份账本：一个「集群负载高」的过载登记（带下次到期时间）。 */
+/** 造一份账本：一个「服务暂时不可用」类的登记（带下次到期时间，样本用 529）。 */
 function overloadLedger(
   sessionId: string,
   over: Partial<{ dueAt: number; overloadAttempts: number; tailTime: number }> = {},
@@ -165,7 +165,7 @@ describe('runRetryTick：周期重试', () => {
   })
 })
 
-describe('runRetryTick：过载类（529 集群负载高）按到期时间、只重试一次', () => {
+describe('runRetryTick：「服务暂时不可用」类按到期时间、只重试一次', () => {
   it('还没到 5 分钟（dueAt 未到）→ 跳过，连会话都不观察、不投递', async () => {
     const ledger = overloadLedger('busy', { dueAt: NOW + 300_000 })
     let observed = 0
@@ -187,7 +187,7 @@ describe('runRetryTick：过载类（529 集群负载高）按到期时间、只
     expect(ledger.active['busy']).toBeUndefined()
     expect(report.overloadDone).toEqual(['busy'])
     expect(report.retried).toHaveLength(0) // 不混进普通重试流水
-    expect(ledger.abandoned['busy']?.reason).toContain('集群负载')
+    expect(ledger.abandoned['busy']?.reason).toContain('服务暂时不可用')
   })
 
   it('到期、会话已经续成功（走完/被停）→ 摘出账本，不投递', async () => {

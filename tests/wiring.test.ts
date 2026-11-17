@@ -589,6 +589,53 @@ describe('apply 行为：中止当下就登记', async () => {
     else process.env.DSH_HOME = originalHome
   })
 
+  it('GLM 500 中文网络错误 → 也登记成 5 分钟×1 次条目（overload + dueAt）', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const originalHome = process.env.DSH_HOME
+    const home = join(tmpdir(), `auto-resume-test-${Math.random().toString(36).slice(2)}`)
+    process.env.DSH_HOME = home
+    const before = Date.now()
+    const { ctx, fire } = ctxWithEvents({})
+    apply(ctx, { startupDelayMs: 500_000, retryIntervalMs: 600_000 })
+    // 2026-11-17 现场原文：宿主把整个 JSON 当 message 传过来。
+    const raw = 'GLM request failed (500): {"type":"error","error":{"type":"api_error","code":"1234","message":"[1234][网络错误，错误id 2026111717514450482b4b650d4f74 ，请稍后重试。][2026111717514450482b4b650d4f74]"},"request_id":"2026111717514450482b4b650d4f74"}'
+    fire('session/event', { id: 'glm-net' }, {
+      type: 'turn/end',
+      time: NOW,
+      data: { turn: 1, reason: { kind: 'error', error: { message: raw } } },
+    })
+    const ledgerPath = join(home, 'auto-resume', 'retry-ledger.json')
+    const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8')) as typeof ledgerShape
+    const entry = onDisk.active['glm-net'] as { overload?: boolean; dueAt?: number } | undefined
+    expect(entry?.overload).toBe(true)
+    expect(entry?.dueAt).toBeGreaterThanOrEqual(before + 300_000 - 2_000)
+    infoSpy.mockRestore()
+    if (originalHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = originalHome
+  })
+
+  it('普通 429 限速 → 不打 5 分钟×1 次的标（仍走普通节奏）', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const originalHome = process.env.DSH_HOME
+    const home = join(tmpdir(), `auto-resume-test-${Math.random().toString(36).slice(2)}`)
+    process.env.DSH_HOME = home
+    const { ctx, fire } = ctxWithEvents({})
+    apply(ctx, { startupDelayMs: 500_000, retryIntervalMs: 600_000 })
+    fire('session/event', { id: 'rate-1' }, {
+      type: 'turn/end',
+      time: NOW,
+      data: { turn: 1, reason: { kind: 'error', error: { message: 'Request failed with 429 Too Many Requests' } } },
+    })
+    const ledgerPath = join(home, 'auto-resume', 'retry-ledger.json')
+    const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8')) as typeof ledgerShape
+    const entry = onDisk.active['rate-1'] as { overload?: boolean } | undefined
+    expect(entry).toBeDefined()
+    expect(entry?.overload).toBeUndefined()
+    infoSpy.mockRestore()
+    if (originalHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = originalHome
+  })
+
   /** 账本文件的形状（测试里做形状断言用）。 */
   const ledgerShape = {
     active: {} as Record<string, unknown>,

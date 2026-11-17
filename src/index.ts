@@ -36,8 +36,8 @@ export const inject = ['sessionQuery', 'agents', 'workspaceRegistry', 'sessionCo
 
 /**
  * 周期心跳：每隔这么久看一眼账本，按每个条目自己的 `dueAt` 决定谁到点。
- * 不用「一个全局 setInterval(retryIntervalMs)」了——过载类要精确到 5 分钟、
- * 普通类要 10 分钟，两个节奏只能由账本里的到期时间表达，心跳只负责勤快地看。
+ * 不用「一个全局 setInterval(retryIntervalMs)」了——「服务暂时不可用」类要精确到
+ * 5 分钟、普通类要 10 分钟，两个节奏只能由账本里的到期时间表达，心跳只负责勤快地看。
  * 60 秒的粒度对「等 5 分钟」足够（最多晚 1 分钟），代价是每分钟一次空转检查。
  */
 const RETRY_HEARTBEAT_MS = 60_000
@@ -80,7 +80,7 @@ export interface ActiveRetryRow {
   attempts: number
   failures: number
   parentId?: string
-  /** 过载类（529 集群负载高）标记；在等 5 分钟时会带 dueAt。 */
+  /** 过载类（服务暂时不可用：5xx / 集群负载 / 网络错误等）标记；在等 5 分钟时会带 dueAt。 */
   overload?: boolean
   dueAt?: number
   overloadAttempts?: number
@@ -235,7 +235,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
       const overload = retryLedger.active[sessionId]?.overload === true
       console.info(
         `auto-resume: 已登记暂时性失败会话 ${sessionId}${parentId === undefined ? '' : `（父 ${parentId}）`}，`
-        + (overload ? `集群负载高，等 ${String(Math.round(config.overloadRetryDelayMs / 60_000))} 分钟后重试一次` : '周期里会再试'),
+        + (overload ? `服务暂时不可用，等 ${String(Math.round(config.overloadRetryDelayMs / 60_000))} 分钟后重试一次` : '周期里会再试'),
       )
     } catch (error) {
       console.error('auto-resume: 会话事件登记失败', error)
@@ -258,7 +258,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
     timer.unref?.()
 
     // 周期重试：心跳按固定短间隔看账本，每个条目自己的 `dueAt` 说了算——
-    // 普通暂时性失败 10 分钟一轮，「集群负载高 / 529」类 5 分钟后重试一次。
+    // 普通暂时性失败 10 分钟一轮，「服务暂时不可用」类 5 分钟后重试一次。
     // 整个回调就地兜底——宿主把没人接的异常当致命错误，一条漏网的就能把整个进程带崩。
     let interval: NodeJS.Timeout | undefined
     if (retryEnabled(config)) {

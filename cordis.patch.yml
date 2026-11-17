@@ -22,6 +22,7 @@
         # 普通暂时性失败：10 分钟一轮，连续 3 次放弃
         retryIntervalMs: 600000
         maxRetries: 3
-        # 「集群负载高 / 529 overloaded_error」：等 5 分钟后重试一次即收手
+        # 「服务暂时不可用」：5xx / 集群负载 / 中文网络错误 / 请稍后重试
+        # 等 5 分钟后重试一次即收手（429 / 401 / 超时仍走上面的普通节奏）
         overloadRetryDelayMs: 300000
         overloadMaxRetries: 1

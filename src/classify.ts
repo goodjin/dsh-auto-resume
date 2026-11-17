@@ -75,15 +75,36 @@ export function errorDetail(error: unknown): string | undefined {
   let code: string | undefined
   if (typeof error === 'object' && error !== null) {
     const record = error as Record<string, unknown>
-    const message = record.message
-    text = typeof message === 'string' && message.trim() !== '' ? message : JSON.stringify(error)
+    // 有些网关把内层 error 对象整个传过来（顶层无 message），或把关键文案放在
+    // 嵌套的 error.message / type 里。先把这些可读字段挖出来，别让一串 JSON
+    // 把「网络错误」「请稍后重试」这类判定依据挤到 200 字截断线之外。
+    text = firstNonEmptyString(record.message)
+      ?? firstNonEmptyString(nestedRecord(record, 'error')?.message)
+      ?? firstNonEmptyString(record.type)
+      ?? JSON.stringify(error)
     code = typeof record.code === 'string' ? record.code : undefined
   } else if (error !== undefined && error !== null) {
     text = String(error)
   }
   if (text === undefined) return undefined
   if (code !== undefined && code !== '' && !text.includes(code)) text = `${text} [${code}]`
-  return text.length > 200 ? `${text.slice(0, 200)}…` : text
+  // 截断优先保住尾部：网关常把状态码/前缀堆在前面、把「网络错误，请稍后重试」
+  // 放在末尾。整句超长时留头 100 + 尾 100，判定依据不因截断丢失。
+  if (text.length <= 200) return text
+  return `${text.slice(0, 100)}…${text.slice(-100)}`
+}
+
+/** 取对象里第一个非空字符串字段（形状不对回 undefined）。 */
+function firstNonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined
+}
+
+/** 取对象里嵌一层的 record（形状不对回 undefined）。 */
+function nestedRecord(record: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = record[key]
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 /**
@@ -106,31 +127,55 @@ const TRANSIENT_PATTERNS: RegExp[] = [
   // overloaded_error 这类英文类型也一并认，避免只靠一个关键词漏判（2026-11-17）。
   /\b529\b/,
   /集群负载|请稍后重试|负载较高|服务集群|overloaded_error/i,
+  // 5xx 里其余常见的服务端错误（尤其 500）；GLM 网关用 500 包「网络错误，请稍后重试」
+  // （2026-11-17 现场）。只认「(500) / status 500 / failed 500」这类状态码语境，
+  // 不认裸数字（请求 id、时间戳里也可能出现 500）。中文网络类说法也补上，别只认英文。
+  /(\(|\bstatus\s*[:=]?\s*|\bfailed\s*[:=]?\s*|\bcode\s*[:=]?\s*)5\d\d\b/i,
+  /网络错误|网络异常|网络连接|连接失败|连接中断|网络(不可用|中断|超时)/i,
+  /api_error|内部错误|internal server error/i,
 ]
 
 /**
- * 「集群负载高 / 过载」这一类暂时性失败：值得等久一点、且只重试一次。
+ * 「服务暂时不可用」这一类暂时性失败：值得等 5 分钟、只重试一次。
  *
- * 它比一般暂时性失败更特殊——服务端明确说「负载高，请稍后重试」，秒级或
- * 十分钟内反复重投只会继续被拒，所以单列一个节奏（默认等 5 分钟、重试一次）。
- * 判定证据：529 状态码、`overloaded_error` 类型、或中英文「负载高/稍后重试」文案。
+ * 服务端明确说「负载高 / 网络错误 / 请稍后重试」「5xx」「api_error」，说明这会儿
+ * 发不出去或处理不了，秒级或十分钟内反复重投只会继续被拒。它比一般暂时性失败
+ * 更特殊，所以单列一个节奏（默认等 5 分钟、重试一次）。
+ *
+ * 判定证据（任一）：529 状态码、overloaded_error、集群负载/负载较高、其余 5xx、
+ * api_error、中文网络错误/异常、「请稍后重试」。**不含** 429 限速、401 登录、纯超时
+ * ——它们仍走普通 10 分钟×3 的节奏（额度类重试无意义，登录类要人来处理）。
  */
-const OVERLOAD_PATTERNS: RegExp[] = [
+const SHORT_UNAVAILABLE_PATTERNS: RegExp[] = [
   /\b529\b/,
-  /overloaded_error|集群负载|负载较高|请稍后重试|服务集群/i,
+  /overloaded_error|集群负载|负载较高|服务集群/i,
+  /(\(|\bstatus\s*[:=]?\s*|\bfailed\s*[:=]?\s*|\bcode\s*[:=]?\s*)5\d\d\b/i,
+  /网络错误|网络异常|网络连接|连接失败|连接中断|网络(不可用|中断|超时)/i,
+  /api_error|internal server error|内部错误/i,
+  /service unavailable|bad gateway|gateway timeout|upstream (error|unavailable)/i,
+  /请稍后重试|稍后再试|try again later|please retry/i,
 ]
 
-/** 是不是「集群负载高 / 过载」类失败（要从普通暂时性失败里分出来单列节奏）。 */
-export function isOverloadErrorDetail(detail: string | undefined): boolean {
+/** 是不是「服务暂时不可用」类失败（走等 5 分钟、只重试一次的单列节奏）。 */
+export function isShortUnavailableErrorDetail(detail: string | undefined): boolean {
   if (detail === undefined || detail === '') return false
-  return OVERLOAD_PATTERNS.some((pattern) => pattern.test(detail))
+  return SHORT_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(detail))
 }
 
-/** 一句话是不是「暂时性失败」（网络 / 限速 / 超时 / 过载这类）。 */
+/**
+ * 「集群负载高 / 过载」判定的兼容入口。
+ *
+ * 上一轮只为 529 overloaded_error 引入了单列节奏；本轮把它扩成「服务暂时不可用」
+ * （中文网络错误、500 等也走这条）。账本、配置、接线仍调用这个名字，保留为别名，
+ * 语义以 `isShortUnavailableErrorDetail` 为准。
+ */
+export const isOverloadErrorDetail = isShortUnavailableErrorDetail
+
+/** 一句话是不是「暂时性失败」（网络 / 限速 / 超时 / 服务暂时不可用这类）。 */
 export function isTransientErrorDetail(detail: string | undefined): boolean {
   if (detail === undefined || detail === '') return false
   return TRANSIENT_PATTERNS.some((pattern) => pattern.test(detail))
-    || isOverloadErrorDetail(detail)
+    || isShortUnavailableErrorDetail(detail)
 }
 
 /**

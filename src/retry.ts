@@ -91,7 +91,7 @@ export async function runRetryTick(
       report.skipped.push({
         sessionId: entry.sessionId,
         detail: entry.overload === true
-          ? `过载等待中，${String(entry.dueAt - options.now)}ms 后到点`
+          ? `服务暂时不可用，等待中，${String(entry.dueAt - options.now)}ms 后到点`
           : `未到重试周期，${String(entry.dueAt - options.now)}ms 后到点`,
       })
       continue
@@ -133,11 +133,11 @@ export async function runRetryTick(
       entry.tailTime = verdict.lastTime
       entry.overloadAttempts = used
       if (used >= options.overloadMaxRetries || !result.ok) {
-        // 收手时留一条「不再重试」标记：服务端若持续 529，会话每个轮次又会以
+        // 收手时留一条「不再重试」标记：服务端若持续报同类错误，会话每个轮次又会以
         // 同样失败收尾、被事件监听重新登记，形成 5 分钟一次的无限循环。标记在
         // 会话走出失败状态（正常完成/被停）时由既有逻辑解除，之后照常重新登记。
         abandon(ledger, entry.sessionId, entry,
-          `集群负载高，等 ${String(Math.round(options.overloadRetryDelayMs / 60_000))} 分钟后已重试 ${String(used)} 次，不再重试`)
+          `服务暂时不可用，等 ${String(Math.round(options.overloadRetryDelayMs / 60_000))} 分钟后已重试 ${String(used)} 次，不再重试`)
         report.overloadDone.push(entry.sessionId)
       } else {
         // 还没到上限：重置到期时间，等下一个 5 分钟（配置 >1 次时才走到这里）。

@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { classifySession, isOverloadErrorDetail, isTransientErrorDetail, type SessionEventLike } from '../src/classify.ts'
+import {
+  errorDetail,
+  isOverloadErrorDetail,
+  isShortUnavailableErrorDetail,
+  isTransientErrorDetail,
+  classifySession,
+  type SessionEventLike,
+} from '../src/classify.ts'
 
 /** now 固定值：2026-11-07 02:00:00 本地。 */
 const NOW = new Date('2026-11-07T02:00:00').getTime()
@@ -96,6 +103,42 @@ describe('classifySession：按最后一轮的结束原因', () => {
     expect(isOverloadErrorDetail('fetch failed [QUOTA_EXCEEDED]')).toBe(false)
     expect(isOverloadErrorDetail('ECONNRESET')).toBe(false)
     expect(isOverloadErrorDetail(undefined)).toBe(false)
+  })
+
+  it('GLM 500 中文网络错误 → 算暂时性失败、且归「服务短暂不可用」走 5 分钟×1 次', () => {
+    // 2026-11-17 现场原文
+    const glm = 'GLM request failed (500): {"type":"error","error":{"type":"api_error","code":"1234","message":"[1234][网络错误，错误id 2026111717514450482b4b650d4f74 ，请稍后重试。][2026111717514450482b4b650d4f74]"},"request_id":"2026111717514450482b4b650d4f74"}'
+    expect(isTransientErrorDetail(glm)).toBe(true)
+    expect(isShortUnavailableErrorDetail(glm)).toBe(true)
+    // 拆开的特征也都要认：纯中文网络错误、只有 500、只有「请稍后重试」、api_error。
+    expect(isTransientErrorDetail('GLM request failed (500): 网络错误，错误id 123')).toBe(true)
+    expect(isShortUnavailableErrorDetail('网络错误，连接中断')).toBe(true)
+    expect(isShortUnavailableErrorDetail('网络异常，请稍后重试')).toBe(true)
+    expect(isShortUnavailableErrorDetail('GLM request failed (500): ')).toBe(true)
+    expect(isShortUnavailableErrorDetail('api_error: internal glitch')).toBe(true)
+    expect(isShortUnavailableErrorDetail('503 Service Unavailable')).toBe(true)
+    expect(isShortUnavailableErrorDetail('请稍后重试')).toBe(true)
+  })
+
+  it('服务短暂不可用不含 429 限速 / 401 登录 / 纯超时（仍走普通节奏）', () => {
+    expect(isShortUnavailableErrorDetail('429 Too Many Requests')).toBe(false)
+    expect(isShortUnavailableErrorDetail('fetch failed [QUOTA_EXCEEDED]')).toBe(false)
+    expect(isShortUnavailableErrorDetail('401 unauthorized')).toBe(false)
+    expect(isShortUnavailableErrorDetail('request timed out')).toBe(false)
+    expect(isShortUnavailableErrorDetail(undefined)).toBe(false)
+  })
+
+  it('errorDetail：嵌套 error.message 也能挖出中文网络错误，且截断不丢关键词', () => {
+    // 宿主只传内层 error 对象（无顶层 message）时，原来会 JSON.stringify 整个对象。
+    const inner = { type: 'api_error', code: '1234', message: '网络错误，请稍后重试' }
+    const detail = errorDetail(inner)
+    expect(detail).toContain('网络错误')
+    expect(isShortUnavailableErrorDetail(detail)).toBe(true)
+    // 超长前缀 + 末尾关键词：截断后仍要认得出来。
+    const long = `${'x'.repeat(300)} 网络错误，请稍后重试`
+    const truncated = errorDetail({ message: long })
+    expect(truncated).toBeDefined()
+    expect(isShortUnavailableErrorDetail(truncated)).toBe(true)
   })
 
   it('error 且 includeError=false → skip error-excluded（账目里看得出是开关挡的）', () => {

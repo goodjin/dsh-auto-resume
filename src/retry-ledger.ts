@@ -20,7 +20,7 @@ import { isOverloadErrorDetail } from './classify.ts'
 /** 按失败类型生成一条活跃登记的输入。 */
 export interface MakeActiveRetryEntryInput {
   sessionId: string
-  /** 失败摘要；据此判定是不是「集群负载高 / 过载」类。 */
+  /** 失败摘要；据此判定是不是「服务暂时不可用」类（5xx / 集群负载 / 网络错误等）。 */
   detail?: string
   /** 登记时刻（epoch ms）。 */
   now: number
@@ -28,7 +28,7 @@ export interface MakeActiveRetryEntryInput {
   existing?: RetryActiveEntry | undefined
   /** 子会话的父会话 id。 */
   parentId?: string | undefined
-  /** 过载类等待时长（默认由配置传入）。 */
+  /** 「服务暂时不可用」类等待时长（默认由配置传入）。 */
   overloadRetryDelayMs: number
   /** 普通暂时性失败的全局周期（保留参数以便将来统一到期模型）。 */
   retryIntervalMs: number
@@ -38,7 +38,8 @@ export interface MakeActiveRetryEntryInput {
  * 生成一条活跃登记：按每个会话自己的「下次到期时间」驱动周期重试。
  *
  * - 普通暂时性失败：`dueAt = now + retryIntervalMs`，沿用 10 分钟一次的节奏；
- * - 「集群负载高 / 过载（529）」类：`overload` 打标、`dueAt = now + overloadRetryDelayMs`，
+ * - 「服务暂时不可用」类（529/集群负载、500 等 5xx、api_error、中文网络错误、
+ *   「请稍后重试」）：`overload` 打标、`dueAt = now + overloadRetryDelayMs`，
  *   等 5 分钟后只重试一次就收手。
  *
  * 所有条目都带 `dueAt`，周期心跳就只需一个短间隔，到没到点由账本说了算（重启也不丢）。
@@ -59,8 +60,8 @@ export function makeActiveRetryEntry(input: MakeActiveRetryEntryInput): RetryAct
     dueAt: existing?.dueAt ?? now + (overload ? overloadRetryDelayMs : retryIntervalMs),
   }
   if (!overload) return base
-  // 重复登记同一过载会话：已在等待/已试过的不重置到期与计数，否则服务每次
-  // 继续报 529 都会把「等 5 分钟」无限往后推，永远等不到重投。
+  // 重复登记同一「服务暂时不可用」会话：已在等待/已试过的不重置到期与计数，否则服务每次
+  // 继续报同类错误都会把「等 5 分钟」无限往后推，永远等不到重投。
   return {
     ...base,
     overload: true,
@@ -83,15 +84,15 @@ export interface RetryActiveEntry {
   /** 子会话时有值：投递走子代理路由的正门。 */
   parentId?: string
   /**
-   * 「集群负载高 / 过载（529）」类失败的单列节奏标记。
-   * 这类失败服务端明说「负载高，请稍后重试」，不适合秒级或十分钟内反复重投：
+   * 「服务暂时不可用」类失败的单列节奏标记（内部沿用 overload 字段名，兼容旧账本）。
+   * 服务端明确说「负载高 / 网络错误 / 请稍后重试」或回 5xx，说明这会儿处理不了：
    * 按 `dueAt` 等一段时间，只重试 `overloadMaxRetries` 次就收手。
    * 老账本里没有这些字段的条目一律当普通暂时性失败（兼容旧数据）。
    */
   overload?: boolean
-  /** 过载类条目的下次到期时间（epoch ms）；没到点周期不碰它。 */
+  /** 这类条目的下次到期时间（epoch ms）；没到点周期不碰它。 */
   dueAt?: number
-  /** 过载类条目已经等完并重投过几次。 */
+  /** 这类条目已经等完并重投过几次。 */
   overloadAttempts?: number
 }
 
