@@ -7,6 +7,7 @@ import {
   emptyLedger,
   isAbandonedHere,
   loadRetryLedger,
+  makeActiveRetryEntry,
   pluginDataDir,
   retryLedgerPath,
   saveRetryLedger,
@@ -51,6 +52,45 @@ describe('isAbandonedHere：放弃标记是否仍然作数', () => {
 
   it('没放弃过的会话 → 不受影响', () => {
     expect(isAbandonedHere(ledger, 'other', NOW - HOUR_BACK)).toBeUndefined()
+  })
+})
+
+describe('makeActiveRetryEntry：按失败类型生成登记条目', () => {
+  const opts = { overloadRetryDelayMs: 300_000, retryIntervalMs: 600_000 }
+
+  it('普通暂时性失败 → 普通条目（dueAt = now + 10 分钟周期，无 overload）', () => {
+    const entry = makeActiveRetryEntry({
+      sessionId: 's1', detail: 'fetch failed [QUOTA_EXCEEDED]', now: NOW, existing: undefined, ...opts,
+    })
+    expect(entry.overload).toBeUndefined()
+    expect(entry.dueAt).toBe(NOW + 600_000)
+    expect(entry).toMatchObject({ sessionId: 's1', attempts: 0, failures: 0, registeredAt: NOW })
+  })
+
+  it('529 集群负载高 → 打上 overload 标记，dueAt = now + 5 分钟', () => {
+    const detail = 'MiniMax request failed (529): 当前服务集群负载较高，请稍后重试'
+    const entry = makeActiveRetryEntry({ sessionId: 'busy', detail, now: NOW, existing: undefined, ...opts })
+    expect(entry.overload).toBe(true)
+    expect(entry.dueAt).toBe(NOW + 300_000)
+    expect(entry.overloadAttempts).toBe(0)
+  })
+
+  it('重复登记同一过载会话 → 不重置到期时间与已试次数（避免一直被往后推）', () => {
+    const detail = '当前服务集群负载较高，请稍后重试'
+    const existing = makeActiveRetryEntry({ sessionId: 'busy', detail, now: NOW - 60_000, existing: undefined, ...opts })
+    existing.overloadAttempts = 1
+    const again = makeActiveRetryEntry({ sessionId: 'busy', detail, now: NOW, existing, ...opts })
+    expect(again.dueAt).toBe(NOW - 60_000 + 300_000)
+    expect(again.overloadAttempts).toBe(1)
+    expect(again.registeredAt).toBe(NOW - 60_000)
+  })
+
+  it('保留 parentId 与 detail', () => {
+    const entry = makeActiveRetryEntry({
+      sessionId: 'c', detail: 'overloaded_error (529)', now: NOW, existing: undefined, parentId: 'p', ...opts,
+    })
+    expect(entry.parentId).toBe('p')
+    expect(entry.detail).toBe('overloaded_error (529)')
   })
 })
 

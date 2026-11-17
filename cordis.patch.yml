@@ -19,3 +19,9 @@
         staggerMs: 2000
         includeError: true
         includeDisposed: true
+        # 普通暂时性失败：10 分钟一轮，连续 3 次放弃
+        retryIntervalMs: 600000
+        maxRetries: 3
+        # 「集群负载高 / 529 overloaded_error」：等 5 分钟后重试一次即收手
+        overloadRetryDelayMs: 300000
+        overloadMaxRetries: 1

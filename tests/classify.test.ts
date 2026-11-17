@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { classifySession, isTransientErrorDetail, type SessionEventLike } from '../src/classify.ts'
+import { classifySession, isOverloadErrorDetail, isTransientErrorDetail, type SessionEventLike } from '../src/classify.ts'
 
 /** now 固定值：2026-11-07 02:00:00 本地。 */
 const NOW = new Date('2026-11-07T02:00:00').getTime()
@@ -75,6 +75,27 @@ describe('classifySession：按最后一轮的结束原因', () => {
     expect(isTransientErrorDetail('upstream overloaded, try again')).toBe(true)
     expect(isTransientErrorDetail('Cannot switch to acp:x/y: context compaction failed')).toBe(false)
     expect(isTransientErrorDetail(undefined)).toBe(false)
+  })
+
+  it('MiniMax 529 集群负载较高 → 算暂时性失败（2026-11-17 现场）', () => {
+    const detail = 'MiniMax request failed (529): {"type":"error","error":{"type":"overloaded_error","message":"当前服务集群负载较高，请稍后重试，感谢您的耐心等待。 (2064) (529)"},"request_id":"074b0683ba33148843daa653f2e30540"}'
+    expect(isTransientErrorDetail(detail)).toBe(true)
+    // 拆开的特征也都要认：只有状态码、只有中文文案、只有英文错误类型。
+    expect(isTransientErrorDetail('MiniMax request failed (529)')).toBe(true)
+    expect(isTransientErrorDetail('当前服务集群负载较高，请稍后重试')).toBe(true)
+    expect(isTransientErrorDetail('overloaded_error: cluster busy')).toBe(true)
+  })
+
+  it('isOverloadErrorDetail：只把「集群负载/过载」类单独认出来', () => {
+    const detail = 'MiniMax request failed (529): {"type":"error","error":{"type":"overloaded_error","message":"当前服务集群负载较高，请稍后重试"}}'
+    expect(isOverloadErrorDetail(detail)).toBe(true)
+    expect(isOverloadErrorDetail('当前服务集群负载较高，请稍后重试')).toBe(true)
+    expect(isOverloadErrorDetail('overloaded_error (529)')).toBe(true)
+    // 普通暂时性失败不算过载类，仍走原来的 10 分钟×3 节奏。
+    expect(isOverloadErrorDetail('429 Too Many Requests')).toBe(false)
+    expect(isOverloadErrorDetail('fetch failed [QUOTA_EXCEEDED]')).toBe(false)
+    expect(isOverloadErrorDetail('ECONNRESET')).toBe(false)
+    expect(isOverloadErrorDetail(undefined)).toBe(false)
   })
 
   it('error 且 includeError=false → skip error-excluded（账目里看得出是开关挡的）', () => {

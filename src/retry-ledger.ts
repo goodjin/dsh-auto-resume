@@ -15,6 +15,59 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+import { isOverloadErrorDetail } from './classify.ts'
+
+/** 按失败类型生成一条活跃登记的输入。 */
+export interface MakeActiveRetryEntryInput {
+  sessionId: string
+  /** 失败摘要；据此判定是不是「集群负载高 / 过载」类。 */
+  detail?: string
+  /** 登记时刻（epoch ms）。 */
+  now: number
+  /** 同一会话已有的登记（重复失败时保留到期时间与已试次数，不往后推）。 */
+  existing?: RetryActiveEntry | undefined
+  /** 子会话的父会话 id。 */
+  parentId?: string | undefined
+  /** 过载类等待时长（默认由配置传入）。 */
+  overloadRetryDelayMs: number
+  /** 普通暂时性失败的全局周期（保留参数以便将来统一到期模型）。 */
+  retryIntervalMs: number
+}
+
+/**
+ * 生成一条活跃登记：按每个会话自己的「下次到期时间」驱动周期重试。
+ *
+ * - 普通暂时性失败：`dueAt = now + retryIntervalMs`，沿用 10 分钟一次的节奏；
+ * - 「集群负载高 / 过载（529）」类：`overload` 打标、`dueAt = now + overloadRetryDelayMs`，
+ *   等 5 分钟后只重试一次就收手。
+ *
+ * 所有条目都带 `dueAt`，周期心跳就只需一个短间隔，到没到点由账本说了算（重启也不丢）。
+ * 纯函数，两个登记入口（会话事件广播、启动扫描）共用，避免两边判定漂移。
+ */
+export function makeActiveRetryEntry(input: MakeActiveRetryEntryInput): RetryActiveEntry {
+  const { sessionId, detail, now, existing, parentId, overloadRetryDelayMs, retryIntervalMs } = input
+  const overload = isOverloadErrorDetail(detail)
+  const base: RetryActiveEntry = {
+    sessionId,
+    ...(detail === undefined ? {} : { detail }),
+    tailTime: now,
+    attempts: existing?.attempts ?? 0,
+    failures: existing?.failures ?? 0,
+    registeredAt: existing?.registeredAt ?? now,
+    ...(parentId === undefined ? {} : { parentId }),
+    // 老账本里没有 dueAt 的条目：缺字段就当「这轮到期」，重投后自愈成有 dueAt。
+    dueAt: existing?.dueAt ?? now + (overload ? overloadRetryDelayMs : retryIntervalMs),
+  }
+  if (!overload) return base
+  // 重复登记同一过载会话：已在等待/已试过的不重置到期与计数，否则服务每次
+  // 继续报 529 都会把「等 5 分钟」无限往后推，永远等不到重投。
+  return {
+    ...base,
+    overload: true,
+    overloadAttempts: existing?.overloadAttempts ?? 0,
+  }
+}
+
 /** 一条还在重试周期里的登记。 */
 export interface RetryActiveEntry {
   sessionId: string
@@ -29,6 +82,17 @@ export interface RetryActiveEntry {
   registeredAt: number
   /** 子会话时有值：投递走子代理路由的正门。 */
   parentId?: string
+  /**
+   * 「集群负载高 / 过载（529）」类失败的单列节奏标记。
+   * 这类失败服务端明说「负载高，请稍后重试」，不适合秒级或十分钟内反复重投：
+   * 按 `dueAt` 等一段时间，只重试 `overloadMaxRetries` 次就收手。
+   * 老账本里没有这些字段的条目一律当普通暂时性失败（兼容旧数据）。
+   */
+  overload?: boolean
+  /** 过载类条目的下次到期时间（epoch ms）；没到点周期不碰它。 */
+  dueAt?: number
+  /** 过载类条目已经等完并重投过几次。 */
+  overloadAttempts?: number
 }
 
 /** 一条已放弃的登记（连续失败到上限，不再重试）。 */

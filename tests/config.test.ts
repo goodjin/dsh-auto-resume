@@ -16,6 +16,8 @@ describe('resolveConfig：缺省补默认、负数取 0', () => {
       maxChildResumes: 10,
       retryIntervalMs: 600_000,
       maxRetries: 3,
+      overloadRetryDelayMs: 300_000,
+      overloadMaxRetries: 1,
       messageTemplate: DEFAULT_MESSAGE_TEMPLATE,
       childMessageTemplate: DEFAULT_CHILD_MESSAGE_TEMPLATE,
     })
@@ -40,6 +42,19 @@ describe('resolveConfig：缺省补默认、负数取 0', () => {
     const resolved = resolveConfig({ retryIntervalMs: 0, maxRetries: 5 })
     expect(resolved.retryIntervalMs).toBe(0)
     expect(resolved.maxRetries).toBe(5)
+  })
+
+  it('过载类失败单列节奏：默认等 5 分钟、只重试一次，两个值都可配', () => {
+    expect(resolveConfig({}).overloadRetryDelayMs).toBe(300_000)
+    expect(resolveConfig({}).overloadMaxRetries).toBe(1)
+    const resolved = resolveConfig({ overloadRetryDelayMs: 60_000, overloadMaxRetries: 2 })
+    expect(resolved.overloadRetryDelayMs).toBe(60_000)
+    expect(resolved.overloadMaxRetries).toBe(2)
+  })
+
+  it('过载类节奏负数取 0（0 = 不等、不重试）', () => {
+    expect(resolveConfig({ overloadRetryDelayMs: -5 }).overloadRetryDelayMs).toBe(0)
+    expect(resolveConfig({ overloadMaxRetries: -1 }).overloadMaxRetries).toBe(0)
   })
 
   it('负数值取 0', () => {

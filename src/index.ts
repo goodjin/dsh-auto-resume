@@ -21,7 +21,7 @@ import type { ContinueCause } from './classify.ts'
 import { scanSessions, type RecentEnumeration, type ScanHosts, type ScanLedgerRow } from './scan.ts'
 import { listRecentByFs, sessionsRoot } from './recent.ts'
 import { errorDetail, isTransientErrorDetail, type SessionEventLike } from './classify.ts'
-import { loadRetryLedger, saveRetryLedger, retryLedgerPath, type RetryLedger } from './retry-ledger.ts'
+import { loadRetryLedger, makeActiveRetryEntry, saveRetryLedger, retryLedgerPath, type RetryLedger } from './retry-ledger.ts'
 import { runRetryTick, type RetrySessionDeps, type RetryTickReport } from './retry.ts'
 import { deliverContinuations, type ChildResumeHost, type DeliveryResult, type DeliveryTarget, type DeliverIo, type PromptHost } from './deliver.ts'
 import { registerHealthRoute, type HealthRouteContext } from './route.ts'
@@ -33,6 +33,19 @@ export const name = 'auto-resume'
 
 /** 必需的宿主服务：缺席即本行装载失败（fail loud，不留静默残废）。 */
 export const inject = ['sessionQuery', 'agents', 'workspaceRegistry', 'sessionController']
+
+/**
+ * 周期心跳：每隔这么久看一眼账本，按每个条目自己的 `dueAt` 决定谁到点。
+ * 不用「一个全局 setInterval(retryIntervalMs)」了——过载类要精确到 5 分钟、
+ * 普通类要 10 分钟，两个节奏只能由账本里的到期时间表达，心跳只负责勤快地看。
+ * 60 秒的粒度对「等 5 分钟」足够（最多晚 1 分钟），代价是每分钟一次空转检查。
+ */
+const RETRY_HEARTBEAT_MS = 60_000
+
+/** 周期重试是否启用：普通节奏或过载节奏任一开着就算启用。 */
+function retryEnabled(config: ResolvedConfig): boolean {
+  return config.retryIntervalMs > 0 || config.overloadRetryDelayMs > 0
+}
 
 /** 插件 apply 需要的宿主上下文面（注入服务 + effect + 机会式 get/inject）。 */
 interface PluginContext extends ScanHosts, HealthRouteContext {
@@ -61,12 +74,24 @@ export interface ScanSnapshot {
   retries: RetryReport
 }
 
+/** 健康路由里一条「还在周期里」的会话账目。 */
+export interface ActiveRetryRow {
+  sessionId: string
+  attempts: number
+  failures: number
+  parentId?: string
+  /** 过载类（529 集群负载高）标记；在等 5 分钟时会带 dueAt。 */
+  overload?: boolean
+  dueAt?: number
+  overloadAttempts?: number
+}
+
 /** 周期重试的账目（路由自报用）。 */
 export interface RetryReport {
   /** 账本文件路径（读不出来时为空，等于没有周期重试）。 */
   ledgerPath: string | null
   /** 还在重试周期里的会话。 */
-  active: Array<{ sessionId: string; attempts: number; failures: number; parentId?: string }>
+  active: ActiveRetryRow[]
   /** 已放弃、不再重试的会话。 */
   abandoned: Array<{ sessionId: string; reason: string; attempts: number }>
   /** 最近一轮重试的动作。 */
@@ -171,7 +196,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
   // 不用等下一次启动扫描。整条回调就地兜底（宿主把没人接的异常当致命错误）。
   ctx.on?.('session/event', (session: unknown, event: unknown) => {
     try {
-      if (retryLedger === null || config.retryIntervalMs <= 0) return
+      if (retryLedger === null || !retryEnabled(config)) return
       const record = event as
         | { type?: string; time?: number; data?: { reason?: { kind?: string; error?: unknown } } }
         | undefined
@@ -195,19 +220,22 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
       if (retryLedger.abandoned[sessionId] !== undefined) return
       const existing = retryLedger.active[sessionId]
       const parentId = sessionParentIdOf(session)
-      retryLedger.active[sessionId] = {
+      const now = record.time ?? Date.now()
+      retryLedger.active[sessionId] = makeActiveRetryEntry({
         sessionId,
         ...(detail === undefined ? {} : { detail }),
-        tailTime: record.time ?? Date.now(),
-        attempts: existing?.attempts ?? 0,
-        failures: existing?.failures ?? 0,
-        registeredAt: existing?.registeredAt ?? Date.now(),
+        now,
+        ...(existing === undefined ? {} : { existing }),
         ...(parentId === undefined ? {} : { parentId }),
-      }
+        overloadRetryDelayMs: config.overloadRetryDelayMs,
+        retryIntervalMs: config.retryIntervalMs,
+      })
       saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), retryLedger)
       snapshot.retries.active = ledgerActiveList()
+      const overload = retryLedger.active[sessionId]?.overload === true
       console.info(
-        `auto-resume: 已登记暂时性失败会话 ${sessionId}${parentId === undefined ? '' : `（父 ${parentId}）`}，周期里会再试`,
+        `auto-resume: 已登记暂时性失败会话 ${sessionId}${parentId === undefined ? '' : `（父 ${parentId}）`}，`
+        + (overload ? `集群负载高，等 ${String(Math.round(config.overloadRetryDelayMs / 60_000))} 分钟后重试一次` : '周期里会再试'),
       )
     } catch (error) {
       console.error('auto-resume: 会话事件登记失败', error)
@@ -229,11 +257,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
     }, config.startupDelayMs)
     timer.unref?.()
 
-    // 周期重试：暂时性失败（网络 / 限速 / 超时）的会话每过一段再投一次，
-    // 连续失败到上限就放弃并标记不再重试。整个回调就地兜底——宿主把没人接的
-    // 异常当致命错误，一条漏网的就能把整个进程带崩。
+    // 周期重试：心跳按固定短间隔看账本，每个条目自己的 `dueAt` 说了算——
+    // 普通暂时性失败 10 分钟一轮，「集群负载高 / 529」类 5 分钟后重试一次。
+    // 整个回调就地兜底——宿主把没人接的异常当致命错误，一条漏网的就能把整个进程带崩。
     let interval: NodeJS.Timeout | undefined
-    if (config.retryIntervalMs > 0) {
+    if (retryEnabled(config)) {
       interval = setInterval(() => {
         if (retryTickRunning) return
         retryTickRunning = true
@@ -244,7 +272,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
           .finally(() => {
             retryTickRunning = false
           })
-      }, config.retryIntervalMs)
+      }, RETRY_HEARTBEAT_MS)
       interval.unref?.()
     }
     return () => {
@@ -322,18 +350,17 @@ async function runRetryCycle(ctx: PluginContext, config: ResolvedConfig): Promis
       includeError: config.includeError,
       includeDisposed: config.includeDisposed,
       maxRetries: config.maxRetries,
+      retryIntervalMs: config.retryIntervalMs,
+      overloadRetryDelayMs: config.overloadRetryDelayMs,
+      overloadMaxRetries: config.overloadMaxRetries,
     },
   )
   const didSomething =
-    report.recovered.length > 0 || report.retried.length > 0 || report.abandoned.length > 0 || report.dropped.length > 0
+    report.recovered.length > 0 || report.retried.length > 0 || report.abandoned.length > 0
+    || report.dropped.length > 0 || report.overloadDone.length > 0
   if (didSomething) saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), ledger)
   snapshot.retries.lastTick = report
-  snapshot.retries.active = Object.values(ledger.active).map((entry) => ({
-    sessionId: entry.sessionId,
-    attempts: entry.attempts,
-    failures: entry.failures,
-    ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
-  }))
+  snapshot.retries.active = ledgerActiveList()
   snapshot.retries.abandoned = Object.entries(ledger.abandoned).map(([sessionId, entry]) => ({
     sessionId,
     reason: entry.reason,
@@ -409,7 +436,7 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
 
   // 暂时性失败（网络 / 限速 / 超时）的会话登记进重试账本：周期到点再投，
   // 连续失败到上限就放弃并标记不再重试。已放弃的会话不会走到这里（扫描层已拦）。
-  if (retryLedger !== null && config.retryIntervalMs > 0) {
+  if (retryLedger !== null && retryEnabled(config)) {
     const delivered = new Map(deliveries.map((delivery) => [delivery.sessionId, delivery]))
     let ledgerDirty = false
     for (const row of rows) {
@@ -422,25 +449,28 @@ async function runOnce(ctx: PluginContext, config: ResolvedConfig): Promise<void
         continue
       }
       retryLedger.active[row.sessionId] = {
-        sessionId: row.sessionId,
-        ...(row.detail === undefined ? {} : { detail: row.detail }),
+        ...makeActiveRetryEntry({
+          sessionId: row.sessionId,
+          ...(row.detail === undefined ? {} : { detail: row.detail }),
+          // 过载类的等待从「本次扫描/登记」起算，不用会话上次的失败时间（可能几小时前）。
+          now: snapshot.startedAt ?? row.lastTime,
+          ...(entry === undefined ? {} : { existing: entry }),
+          ...(row.parentSessionId === undefined ? {} : { parentId: row.parentSessionId }),
+          overloadRetryDelayMs: config.overloadRetryDelayMs,
+          retryIntervalMs: config.retryIntervalMs,
+        }),
+        // 尾部时间始终是会话自己的最后事件时间（放弃标记按它判断会话有没有往前走）。
         tailTime: row.lastTime,
+        // 启动扫描这次已经投递过继续消息：算一次（与旧账目一致）。
+        // 过载类的「等 5 分钟后重试一次」是额外的一次，不计入 overloadAttempts。
         attempts: (entry?.attempts ?? 0) + 1,
-        failures: entry?.failures ?? 0,
-        registeredAt: entry?.registeredAt ?? snapshot.startedAt,
-        ...(row.parentSessionId === undefined ? {} : { parentId: row.parentSessionId }),
       }
       ledgerDirty = true
     }
     // 没变化就不落盘（每次启动都写一遍，等于把账本当成日志用）。
     if (ledgerDirty) {
       saveRetryLedger(retryLedgerPathValue ?? retryLedgerPath(), retryLedger)
-      snapshot.retries.active = Object.values(retryLedger.active).map((entry) => ({
-        sessionId: entry.sessionId,
-        attempts: entry.attempts,
-        failures: entry.failures,
-        ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
-      }))
+      snapshot.retries.active = ledgerActiveList()
     }
   }
 
@@ -486,14 +516,17 @@ function ledgerAbandonedList(): Array<{ sessionId: string; reason: string; attem
   }))
 }
 
-/** 账本活跃区 → 快照里的账目。 */
-function ledgerActiveList(): Array<{ sessionId: string; attempts: number; failures: number; parentId?: string }> {
+/** 账本活跃区 → 快照里的账目（含过载等待信息，健康路由能看见在等 5 分钟的会话）。 */
+function ledgerActiveList(): ActiveRetryRow[] {
   if (retryLedger === null) return []
   return Object.values(retryLedger.active).map((entry) => ({
     sessionId: entry.sessionId,
     attempts: entry.attempts,
     failures: entry.failures,
     ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
+    ...(entry.overload === true ? { overload: true } : {}),
+    ...(entry.dueAt === undefined ? {} : { dueAt: entry.dueAt }),
+    ...(entry.overloadAttempts === undefined ? {} : { overloadAttempts: entry.overloadAttempts }),
   }))
 }
 

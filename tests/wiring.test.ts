@@ -405,6 +405,46 @@ describe('apply 行为：暂时性失败的周期重试登记', async () => {
     if (originalHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = originalHome
   })
+
+  it('启动扫描碰到 529 集群负载高 → 同样登记成过载条目（带 dueAt）', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const originalHome = process.env.DSH_HOME
+    const home = join(tmpdir(), `auto-resume-test-${Math.random().toString(36).slice(2)}`)
+    process.env.DSH_HOME = home
+    const overloaded: SessionEventLike[] = [
+      { type: 'turn/start', time: NOW - HOUR },
+      {
+        type: 'turn/end',
+        time: NOW - HOUR,
+        data: { turn: 1, reason: { kind: 'error', error: { message: 'MiniMax request failed (529): 当前服务集群负载较高，请稍后重试' } } },
+      },
+    ]
+    const services: Record<string, unknown> = {
+      sessionQuery: {
+        async listSessions() { return [{ header: { id: 'busy-scan' } }] },
+        async observeSession() { return { events: overloaded } },
+      },
+      agents: { get: () => undefined },
+      workspaceRegistry: { archivedSessionIds: [] },
+      sessionRecent: {
+        async listRecent() { return [{ sessionId: 'busy-scan', mtime: NOW - HOUR }] },
+      },
+      sessionController: { async prompt() { return { accepted: true } } },
+    }
+    const { ctx } = makeCtx(services)
+    const before = Date.now()
+    apply(ctx, { startupDelayMs: 0, staggerMs: 0, retryIntervalMs: 600_000, maxRetries: 3 })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    const ledgerPath = join(home, 'auto-resume', 'retry-ledger.json')
+    const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8')) as {
+      active: Record<string, { overload?: boolean; dueAt?: number }>
+    }
+    expect(onDisk.active['busy-scan']?.overload).toBe(true)
+    expect(onDisk.active['busy-scan']?.dueAt).toBeGreaterThanOrEqual(before + 300_000 - 2_000)
+    infoSpy.mockRestore()
+    if (originalHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = originalHome
+  })
 })
 
 
@@ -517,6 +557,33 @@ describe('apply 行为：中止当下就登记', async () => {
     expect(onDisk.active['given-up']).toBeUndefined()
     expect(onDisk.abandoned['given-up']).toBeDefined()
     expect(infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')).not.toContain('已登记暂时性失败会话 given-up')
+    infoSpy.mockRestore()
+    if (originalHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = originalHome
+  })
+
+  it('529 集群负载高 → 登记成过载条目（overload + dueAt 约 5 分钟后）', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const originalHome = process.env.DSH_HOME
+    const home = join(tmpdir(), `auto-resume-test-${Math.random().toString(36).slice(2)}`)
+    process.env.DSH_HOME = home
+    const before = Date.now()
+    const { ctx, fire } = ctxWithEvents({})
+    apply(ctx, { startupDelayMs: 500_000, retryIntervalMs: 600_000 })
+    const overloadTurnEnd = {
+      type: 'turn/end',
+      time: NOW,
+      data: { turn: 1, reason: { kind: 'error', error: { message: 'MiniMax request failed (529): 当前服务集群负载较高，请稍后重试' } } },
+    }
+    fire('session/event', { id: 'busy-1' }, overloadTurnEnd)
+    const ledgerPath = join(home, 'auto-resume', 'retry-ledger.json')
+    const onDisk = JSON.parse(readFileSync(ledgerPath, 'utf8')) as typeof ledgerShape
+    const entry = onDisk.active['busy-1'] as { overload?: boolean; dueAt?: number; overloadAttempts?: number } | undefined
+    expect(entry?.overload).toBe(true)
+    expect(entry?.dueAt).toBeGreaterThanOrEqual(before + 300_000 - 2_000)
+    expect(entry?.dueAt).toBeLessThanOrEqual(Date.now() + 300_000 + 2_000)
+    expect(entry?.overloadAttempts).toBe(0)
+    expect(infoSpy.mock.calls.map((args) => args.join(' ')).join('\n')).toContain('已登记暂时性失败会话 busy-1')
     infoSpy.mockRestore()
     if (originalHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = originalHome

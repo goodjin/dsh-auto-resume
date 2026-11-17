@@ -102,12 +102,35 @@ const TRANSIENT_PATTERNS: RegExp[] = [
   /fetch failed/i,
   /network (error|unreachable)|temporarily unavailable|service unavailable/i,
   /upstream (error|unavailable)|overloaded/i,
+  // 529 是部分网关（MiniMax 等）表示「集群过载」的状态码；中文文案与
+  // overloaded_error 这类英文类型也一并认，避免只靠一个关键词漏判（2026-11-17）。
+  /\b529\b/,
+  /集群负载|请稍后重试|负载较高|服务集群|overloaded_error/i,
 ]
 
-/** 一句话是不是「暂时性失败」（网络 / 限速 / 超时这类）。 */
+/**
+ * 「集群负载高 / 过载」这一类暂时性失败：值得等久一点、且只重试一次。
+ *
+ * 它比一般暂时性失败更特殊——服务端明确说「负载高，请稍后重试」，秒级或
+ * 十分钟内反复重投只会继续被拒，所以单列一个节奏（默认等 5 分钟、重试一次）。
+ * 判定证据：529 状态码、`overloaded_error` 类型、或中英文「负载高/稍后重试」文案。
+ */
+const OVERLOAD_PATTERNS: RegExp[] = [
+  /\b529\b/,
+  /overloaded_error|集群负载|负载较高|请稍后重试|服务集群/i,
+]
+
+/** 是不是「集群负载高 / 过载」类失败（要从普通暂时性失败里分出来单列节奏）。 */
+export function isOverloadErrorDetail(detail: string | undefined): boolean {
+  if (detail === undefined || detail === '') return false
+  return OVERLOAD_PATTERNS.some((pattern) => pattern.test(detail))
+}
+
+/** 一句话是不是「暂时性失败」（网络 / 限速 / 超时 / 过载这类）。 */
 export function isTransientErrorDetail(detail: string | undefined): boolean {
   if (detail === undefined || detail === '') return false
   return TRANSIENT_PATTERNS.some((pattern) => pattern.test(detail))
+    || isOverloadErrorDetail(detail)
 }
 
 /**
