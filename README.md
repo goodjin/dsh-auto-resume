@@ -119,8 +119,7 @@ pnpm typecheck   # tsc --noEmit
 pnpm test        # vitest run
 ```
 
-无构建产物：宿主以 strip-only 方式直接装载 `src/*.ts`（与
-`dsh-command-commit-merge-push` 同款）。
+无构建产物：宿主以 strip-only 方式直接装载 `src/*.ts`。
 
 ## 许可
 
