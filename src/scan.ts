@@ -21,8 +21,6 @@ export interface ScanHosts {
   }
   agents: {
     get(id: string): { status?: string } | undefined
-    /** 把持久会话挂上线（不带消息）；子会话投递前用它把父会话挂起来。 */
-    resume?(options: { resumeSessionId: string }): Promise<unknown>
   }
   workspaceRegistry: { archivedSessionIds: readonly string[] }
   /** 缺席时跳过 mtime 预筛（功能不缺，只慢一点）。 */

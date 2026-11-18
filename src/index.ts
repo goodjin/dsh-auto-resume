@@ -47,9 +47,20 @@ function retryEnabled(config: ResolvedConfig): boolean {
   return config.retryIntervalMs > 0 || config.overloadRetryDelayMs > 0
 }
 
+/**
+ * sessionController 上的挂线正门（`agents.resolveAgent`）：`prompt()` 发消息前
+ * 走的就是它——活着直接拿，不在内存则冷恢复并按会话记录重挂 agentPreset，
+ * 组合（预设/技能/本机工具）齐全。可选成员：老宿主没有时拒绝裸恢复挂线。
+ */
+interface SessionControllerAttachFace {
+  agents?: {
+    resolveAgent?(sessionId: string): Promise<unknown>
+  }
+}
+
 /** 插件 apply 需要的宿主上下文面（注入服务 + effect + 机会式 get/inject）。 */
 interface PluginContext extends ScanHosts, HealthRouteContext {
-  sessionController: PromptHost
+  sessionController: PromptHost & SessionControllerAttachFace
   get?(serviceName: string): unknown
   inject?(deps: string[], body: (child: unknown) => void): unknown
   /** 宿主广播的会话事件（轮次收尾等），用于「中止当下就登记」。 */
@@ -534,7 +545,7 @@ function ledgerActiveList(): ActiveRetryRow[] {
  * 子会话恢复通道：父 agent 在线时，经子代理服务把提示排进子会话。
  * 服务缺席时回 undefined——只续父会话，不做子会话恢复。
  */
-function childResumeHostOf(ctx: PluginContext, io: DeliverIo): ChildResumeHost | undefined {
+export function childResumeHostOf(ctx: PluginContext, io: DeliverIo): ChildResumeHost | undefined {
   if (subagentsService === null) return undefined
   const service = subagentsService
   return {
@@ -543,10 +554,27 @@ function childResumeHostOf(ctx: PluginContext, io: DeliverIo): ChildResumeHost |
     attachParent: async (sessionId: string) => {
       const live = ctx.agents.get(sessionId)
       if (live !== undefined) return live
-      const handle = (await ctx.agents.resume?.({ resumeSessionId: sessionId })) as
-        | { agent?: unknown }
+      // 正门：sessionController.agents.resolveAgent——prompt() 发消息前走的同一
+      // 口子，冷恢复会按会话记录重挂 agentPreset。绝不退回裸 ctx.agents.resume：
+      // 那条路不带组合，挂出来的父级只剩 base 工具（2026-11-12 aacc1667 事故：
+      // 73→42，本机命令全部误落云盒子），还会经子会话冷恢复的 composeFrom
+      // （从父级继承组合）传染给整棵会话树，且之后 GUI 继续对话也不自愈。
+      const face = ctx.sessionController.agents
+      if (face === undefined || typeof face.resolveAgent !== 'function') {
+        throw new Error('宿主 sessionController.agents.resolveAgent 缺席：拒绝裸恢复挂线（agent 组合会丢失，宁可不恢复）')
+      }
+      const found = (await face.resolveAgent(sessionId)) as
+        | { agent?: unknown; error?: unknown }
+        | null
         | undefined
-      return handle?.agent ?? handle
+      if (found !== null && typeof found === 'object') {
+        if (found.error !== undefined) {
+          const text = found.error instanceof Error ? found.error.message : String(found.error)
+          throw new Error(`父会话 ${sessionId} 挂线被宿主拒绝：${text}`)
+        }
+        if (found.agent !== undefined) return found.agent
+      }
+      return undefined
     },
     queueChildPrompt: async (parent, childId, content, signal) => {
       if (typeof service.queuePrompt === 'function') {

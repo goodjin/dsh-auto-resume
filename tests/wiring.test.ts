@@ -236,10 +236,6 @@ describe('apply 行为：子会话恢复', async () => {
           // 父会话不在线：插件要先把父会话挂上线，才有资格往子会话投递
           return undefined
         },
-        async resume(options: { resumeSessionId: string }) {
-          resumed.push(options.resumeSessionId)
-          return { agent: { id: options.resumeSessionId } }
-        },
       },
       workspaceRegistry: { archivedSessionIds: [] },
       sessionRecent: {
@@ -257,6 +253,13 @@ describe('apply 行为：子会话恢复', async () => {
         async prompt(request: { sessionId: string }) {
           prompts.push(request)
           return { accepted: true }
+        },
+        // 挂线正门：prompt() 发消息前同款（按会话记录重挂 agentPreset 的冷恢复）
+        agents: {
+          async resolveAgent(sessionId: string) {
+            resumed.push(sessionId)
+            return { agent: { id: sessionId } }
+          },
         },
       },
     }
