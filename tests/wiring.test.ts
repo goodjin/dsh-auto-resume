@@ -15,10 +15,13 @@ describe('接线：package.json 与 patch 行', () => {
     dsh?: { bundle?: { patch?: string }; client?: unknown }
   }
 
-  it('包名与入口：exports["."] 默认指向 src/index.ts', () => {
+  it('包名与入口：exports["."] 默认指向编译产物（装到 node_modules 后不再依赖类型剥离）', () => {
     expect(pkg.name).toBe('@goodjin2/dsh-auto-resume')
-    expect(pkg.main).toBe('./src/index.ts')
-    expect((pkg.exports?.['.'] as { default?: string }).default).toBe('./src/index.ts')
+    expect(pkg.main).toBe('./lib/host/index.js')
+    expect((pkg.exports?.['.'] as { default?: string }).default).toBe('./lib/host/index.js')
+    expect((pkg.exports?.['.'] as { types?: string }).types).toBe('./src/index.ts')
+    // 产物必须真的存在：入口指向一个不存在的文件，装上之后才炸
+    expect(() => readFileSync(join(ROOT, 'lib/host/index.js'), 'utf8')).not.toThrow()
   })
 
   it('dsh.bundle.patch 指向存在的 cordis.patch.yml，且无浏览器半边', () => {
