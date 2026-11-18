@@ -84,7 +84,19 @@
 扫描结果一行日志 + 只读状态路由 `GET /auto-resume/health`（返回最近一次启动的完整
 账目：扫了谁、命中谁、继续了谁、跳过原因分布，以及子代理服务在不在、恢复了哪些子会话）。
 
-## 安装（桌面 profile）
+## 安装
+
+```sh
+dsh plugin --profile <你的 profile> add github:goodjin/dsh-auto-resume
+```
+
+或者安装 npm 上的包（效果相同，同样免构建步骤）：
+
+```sh
+dsh plugin --profile <你的 profile> add @goodjin2/dsh-auto-resume
+```
+
+手工安装（桌面 profile）：
 
 1. `package.json` 依赖加 `"@goodjin2/dsh-auto-resume": "link:<本仓库路径>"`；
 2. `dsh.profile.bundles` 加一条 `@goodjin2/dsh-auto-resume`（bundle id = 包名）；
@@ -130,9 +142,13 @@
 pnpm install
 pnpm typecheck   # tsc --noEmit
 pnpm test        # vitest run
+pnpm build       # 编译宿主产物 lib/host
+pnpm check       # 类型检查 + 测试 + 产物是否与源码一致
 ```
 
-无构建产物：宿主以 strip-only 方式直接装载 `src/*.ts`。
+仓库随附编译产物（`lib/host/**`）：装到 node_modules 之后宿主不能再靠剥离类型来装载
+源码，所以入口指向编译后的 JS。改完源码要跑 `pnpm build` 并提交产物，
+`pnpm check` 会检查产物是否与源码一致。
 
 ## 许可
 
